@@ -1,20 +1,15 @@
 const router = require("express").Router();
 const { protect, adminOnly } = require("../middleware/auth.middleware");
+const { getPendingJobs, approveJob, rejectJob } = require("../controllers/admin.controller");
 
 router.use(protect, adminOnly); // NFR-SEC-04: ทุก route ในนี้ต้องเป็น Admin เท่านั้น
 
 router.get("/dashboard", (req, res) => {
   res.status(501).json({ message: "TODO: สรุปข้อมูลแดชบอร์ด (FR-ADMIN-01)" });
 });
-router.get("/jobs/pending", (req, res) => {
-  res.status(501).json({ message: "TODO: คิวประกาศงานรออนุมัติ (FR-ADMIN-02)" });
-});
-router.post("/jobs/:id/approve", (req, res) => {
-  res.status(501).json({ message: "TODO: อนุมัติงาน -> แจ้งเตือน Worker ในรัศมี 2km ภายใน 1 นาที (FR-JOB-05–06, FR-MATCH-01–02)" });
-});
-router.post("/jobs/:id/reject", (req, res) => {
-  res.status(501).json({ message: "TODO: ปฏิเสธงาน พร้อมเหตุผล (FR-ADMIN-02)" });
-});
+router.get("/jobs/pending", getPendingJobs); // FR-ADMIN-02
+router.post("/jobs/:id/approve", approveJob); // FR-JOB-05–06, FR-MATCH-01–02
+router.post("/jobs/:id/reject", rejectJob); // FR-ADMIN-02
 router.get("/users", (req, res) => {
   res.status(501).json({ message: "TODO: รายชื่อผู้ใช้ + กรองตามบทบาท (FR-ADMIN-03)" });
 });

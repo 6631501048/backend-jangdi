@@ -13,6 +13,13 @@ function signToken(userId) {
   });
 }
 
+/** ตัด field ที่ไม่ควรส่งกลับไปฝั่ง client ออก (เช่น password) */
+function sanitizeUser(user) {
+  const obj = user.toObject ? user.toObject() : user;
+  delete obj.password;
+  return obj;
+}
+
 /**
  * POST /api/auth/register  (FR-AUTH-01, FR-AUTH-02, FR-AUTH-04)
  * ลงทะเบียนด้วยอีเมล Lamduan + รหัสผ่าน แล้วส่งอีเมลยืนยัน (TODO: ต่อ email provider จริง)
@@ -20,8 +27,14 @@ function signToken(userId) {
 const register = asyncHandler(async (req, res) => {
   const { studentId, email, password } = req.body;
 
+  if (!studentId || !email || !password) {
+    return res.status(400).json({ message: "กรุณากรอก studentId, email และ password ให้ครบ" });
+  }
   if (!isLamduanEmail(email)) {
     return res.status(400).json({ message: "ต้องใช้อีเมล @lamduan.mfu.ac.th เท่านั้น" });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ message: "รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร" });
   }
 
   const existing = await User.findOne({ email: email.toLowerCase() });
@@ -38,9 +51,9 @@ const register = asyncHandler(async (req, res) => {
 
   // TODO: ส่งอีเมลยืนยัน (FR-AUTH-04) ผ่าน provider ที่เลือกใช้จริง
   res.status(201).json({
-    message: "ลงทะเบียนสำเร็จ กรุณายืนยันอีเมลก่อนใช้งาน",
+    message: "ลงทะเบียนสำเร็จ",
     token: signToken(user._id),
-    isProfileComplete: user.isProfileComplete,
+    user: sanitizeUser(user),
   });
 });
 
@@ -57,7 +70,7 @@ const login = asyncHandler(async (req, res) => {
   }
   res.json({
     token: signToken(user._id),
-    isProfileComplete: user.isProfileComplete,
+    user: sanitizeUser(user),
   });
 });
 
@@ -98,13 +111,13 @@ const googleLogin = asyncHandler(async (req, res) => {
   res.json({
     token: signToken(user._id),
     isNewUser,
-    isProfileComplete: user.isProfileComplete,
+    user: sanitizeUser(user),
   });
 });
 
 /** GET /api/auth/me */
 const getMe = asyncHandler(async (req, res) => {
-  res.json(req.user);
+  res.json(sanitizeUser(req.user));
 });
 
 /** PATCH /api/auth/role  — FR-AUTH-06: สลับบทบาท Hirer/Worker */
@@ -115,7 +128,7 @@ const switchRole = asyncHandler(async (req, res) => {
   }
   req.user.currentRole = role;
   await req.user.save();
-  res.json({ currentRole: req.user.currentRole });
+  res.json({ user: sanitizeUser(req.user) });
 });
 
 module.exports = { register, login, googleLogin, getMe, switchRole };
