@@ -131,4 +131,29 @@ const switchRole = asyncHandler(async (req, res) => {
   res.json({ user: sanitizeUser(req.user) });
 });
 
-module.exports = { register, login, googleLogin, getMe, switchRole };
+/** PATCH /api/auth/password — FR-PROF-01: เปลี่ยนรหัสผ่าน */
+const changePassword = asyncHandler(async (req, res) => {
+  const { current, next } = req.body;
+  if (!current || !next) {
+    return res.status(400).json({ message: "กรุณากรอกรหัสผ่านปัจจุบันและรหัสผ่านใหม่" });
+  }
+  if (next.length < 8) {
+    return res.status(400).json({ message: "รหัสผ่านใหม่ต้องมีอย่างน้อย 8 ตัวอักษร" });
+  }
+
+  const user = await User.findById(req.user._id).select("+password");
+  if (!user.password) {
+    return res.status(400).json({ message: "บัญชีนี้ล็อกอินด้วย Google ไม่มีรหัสผ่านให้เปลี่ยน" });
+  }
+
+  const match = await bcrypt.compare(current, user.password);
+  if (!match) {
+    return res.status(401).json({ message: "รหัสผ่านปัจจุบันไม่ถูกต้อง" });
+  }
+
+  user.password = await bcrypt.hash(next, 10);
+  await user.save();
+  res.json({ message: "เปลี่ยนรหัสผ่านสำเร็จ" });
+});
+
+module.exports = { register, login, googleLogin, getMe, switchRole, changePassword };

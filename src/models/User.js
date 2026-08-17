@@ -14,6 +14,15 @@ const addressSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const bankAccountSchema = new mongoose.Schema(
+  {
+    bankName: { type: String, trim: true },
+    accountNumber: { type: String, trim: true },
+    accountHolderName: { type: String, trim: true },
+  },
+  { _id: false }
+);
+
 const userSchema = new mongoose.Schema(
   {
     studentId: { type: String, required: true, trim: true },
@@ -40,14 +49,15 @@ const userSchema = new mongoose.Schema(
     facebook: { type: String, trim: true },
     instagram: { type: String, trim: true },
 
+    // FR-PROF-01: บัญชีธนาคารสำหรับรับเงินตอน Admin ปล่อยเงินจาก Escrow (FR-PAY-05)
+    bankAccount: bankAccountSchema,
+
     // FR-PROF-02
     contactAddress: addressSchema,
 
     // FR-AUTH-06: บทบาทปัจจุบันที่ใช้งานอยู่ (สลับได้ ไม่ใช่ field ผูกถาวร)
     currentRole: { type: String, enum: ["hirer", "worker"], default: "hirer" },
     isAdmin: { type: Boolean, default: false },
-    // บัญชีทดสอบระบบ (dev/QA) — ไม่ผูกกับสิทธิ์ admin, ใช้แยกกลุ่มผู้ใช้ทดสอบออกจากผู้ใช้จริง
-    isTester: { type: Boolean, default: false },
 
     // FR-PROF-03 / FR-REV-03: คะแนนความน่าเชื่อถือ คำนวณจาก Feedback
     credibilityScore: { type: Number, default: 0, min: 0, max: 5 },

@@ -1,5 +1,8 @@
 const asyncHandler = require("express-async-handler");
-const { User } = require("../models");
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
+const { User, Feedback } = require("../models");
 
 /** GET /api/users/:id — FR-PROF-01 */
 const getProfile = asyncHandler(async (req, res) => {
@@ -11,7 +14,7 @@ const getProfile = asyncHandler(async (req, res) => {
 /**
  * PATCH /api/users/:id — FR-PROF-01, FR-PROF-02
  * เจ้าของบัญชีเท่านั้นที่แก้ไขได้ (หรือ Admin)
- * body: { fullName, phone, lineId, facebook, instagram, avatarUrl,
+ * body: { fullName, phone, lineId, facebook, instagram, avatarUrl, bankAccount,
  *         contactAddress: { name, address, phone },
  *         lat, lng } // FR-PROF-02 + ตำแหน่งสำหรับ matching (FR-MATCH-01)
  */
@@ -23,7 +26,7 @@ const updateProfile = asyncHandler(async (req, res) => {
   const user = await User.findById(req.params.id);
   if (!user) return res.status(404).json({ message: "ไม่พบผู้ใช้นี้" });
 
-  const { fullName, phone, lineId, facebook, instagram, avatarUrl, contactAddress, lat, lng } = req.body;
+  const { fullName, phone, lineId, facebook, instagram, avatarUrl, bankAccount, contactAddress, lat, lng } = req.body;
 
   if (fullName !== undefined) user.fullName = fullName;
   if (phone !== undefined) user.phone = phone;
@@ -31,6 +34,7 @@ const updateProfile = asyncHandler(async (req, res) => {
   if (facebook !== undefined) user.facebook = facebook;
   if (instagram !== undefined) user.instagram = instagram;
   if (avatarUrl !== undefined) user.avatarUrl = avatarUrl;
+  if (bankAccount !== undefined) user.bankAccount = bankAccount; // FR-PROF-01
   if (contactAddress !== undefined) user.contactAddress = contactAddress; // FR-PROF-02
 
   // FR-MATCH-01: บันทึกตำแหน่งปัจจุบันเพื่อใช้คำนวณระยะทางตอนแจ้งเตือนงานใกล้เคียง
@@ -50,4 +54,59 @@ const updateProfile = asyncHandler(async (req, res) => {
   res.json({ message: "บันทึกโปรไฟล์สำเร็จ", user: sanitized });
 });
 
-module.exports = { getProfile, updateProfile };
+/**
+ * GET /api/users/:id/reviews — FR-PROF-03, FR-REV-04
+ * ดูประวัติรีวิวของผู้ใช้ เรียงล่าสุดก่อน
+ */
+const getReviews = asyncHandler(async (req, res) => {
+  const reviews = await Feedback.find({ toUser: req.params.id })
+    .populate("fromUser", "fullName avatarUrl")
+    .sort({ createdAt: -1 });
+
+  const user = await User.findById(req.params.id).select("credibilityScore reviewCount");
+  if (!user) return res.status(404).json({ message: "ไม่พบผู้ใช้นี้" });
+
+  res.json({
+    averageRating: user.credibilityScore,
+    reviewCount: user.reviewCount,
+    reviews,
+  });
+});
+
+/* ---------- อัปโหลดรูปโปรไฟล์ (FR-PROF-01) ---------- */
+const AVATAR_DIR = path.join(__dirname, "..", "..", "uploads", "avatars");
+fs.mkdirSync(AVATAR_DIR, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, AVATAR_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || ".jpg";
+    cb(null, `${req.user._id}-${Date.now()}${ext}`);
+  },
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith("image/")) {
+      return cb(new Error("อัปโหลดได้เฉพาะไฟล์รูปภาพเท่านั้น"));
+    }
+    cb(null, true);
+  },
+});
+
+/** POST /api/users/me/avatar — multipart/form-data field name: "avatar" */
+const uploadAvatar = [
+  upload.single("avatar"),
+  asyncHandler(async (req, res) => {
+    if (!req.file) return res.status(400).json({ message: "กรุณาแนบไฟล์รูปภาพ" });
+
+    const avatarUrl = `/uploads/avatars/${req.file.filename}`;
+    req.user.avatarUrl = avatarUrl;
+    await req.user.save();
+
+    res.json({ message: "อัปโหลดรูปโปรไฟล์สำเร็จ", avatarUrl });
+  }),
+];
+
+module.exports = { getProfile, updateProfile, getReviews, uploadAvatar };
