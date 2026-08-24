@@ -14,6 +14,15 @@ const addressSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const bankAccountSchema = new mongoose.Schema(
+  {
+    bankName: { type: String, trim: true },
+    accountNumber: { type: String, trim: true },
+    accountHolderName: { type: String, trim: true },
+  },
+  { _id: false }
+);
+
 const userSchema = new mongoose.Schema(
   {
     studentId: { type: String, required: true, trim: true },
@@ -39,6 +48,9 @@ const userSchema = new mongoose.Schema(
     lineId: { type: String, trim: true },
     facebook: { type: String, trim: true },
     instagram: { type: String, trim: true },
+
+    // FR-PROF-01: บัญชีธนาคารสำหรับรับเงินตอน Admin ปล่อยเงินจาก Escrow (FR-PAY-05)
+    bankAccount: bankAccountSchema,
 
     // FR-PROF-02
     contactAddress: addressSchema,
