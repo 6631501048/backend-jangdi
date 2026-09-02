@@ -15,6 +15,7 @@ const feedbackSchema = new mongoose.Schema(
       required: true,
     },
     rating: { type: Number, required: true, min: 1, max: 5 },
+    tags: { type: [String], default: [] },
     comment: { type: String, default: "", trim: true },
   },
   { timestamps: true }
