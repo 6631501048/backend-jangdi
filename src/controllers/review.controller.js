@@ -7,7 +7,11 @@ const { Job, Feedback, User } = require("../models");
  * ทั้ง Hirer และ Worker รีวิวกันได้คนละทิศทางหลังงาน completed เท่านั้น คนละ 1 ครั้ง
  */
 const submitReview = asyncHandler(async (req, res) => {
+<<<<<<< HEAD
   const { rating, comment, tags } = req.body;
+=======
+  const { rating, comment } = req.body;
+>>>>>>> origin/main
   if (!rating || rating < 1 || rating > 5) {
     return res.status(400).json({ message: "คะแนนต้องอยู่ระหว่าง 1-5" });
   }
@@ -35,7 +39,10 @@ const submitReview = asyncHandler(async (req, res) => {
       toUser,
       direction,
       rating,
+<<<<<<< HEAD
       tags: Array.isArray(tags) ? tags : [],
+=======
+>>>>>>> origin/main
       comment: comment || "",
     });
   } catch (err) {

@@ -13,6 +13,11 @@ const jobSchema = new mongoose.Schema(
     title: { type: String, required: true, trim: true },
     description: { type: String, required: true },
     locationText: { type: String, trim: true },
+    // FR-BROWSE-03: รายละเอียดเพิ่มเติมสำหรับงานประเภทจัดส่ง/รับ-ส่งของ (แสดงในหน้า Job Detail / Tracking)
+    fromText: { type: String, trim: true, default: "" },
+    toText: { type: String, trim: true, default: "" },
+    deliveryFee: { type: Number, default: 0, min: 0 },
+    notes: { type: String, trim: true, default: "" },
     location: {
       type: { type: String, enum: ["Point"], default: "Point" },
       coordinates: { type: [Number], required: true }, // [lng, lat]
