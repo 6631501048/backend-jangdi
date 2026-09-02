@@ -58,6 +58,9 @@ const userSchema = new mongoose.Schema(
     // FR-AUTH-06: บทบาทปัจจุบันที่ใช้งานอยู่ (สลับได้ ไม่ใช่ field ผูกถาวร)
     currentRole: { type: String, enum: ["hirer", "worker"], default: "hirer" },
     isAdmin: { type: Boolean, default: false },
+    // ธงสำหรับบัญชีทดสอบของทีมพัฒนา (ไม่ใช่ requirement ใน SRS แต่ใช้แยกบัญชี dev/QA
+    // ออกจากผู้ใช้จริงในรายงาน/แดชบอร์ดได้ในอนาคตถ้าต้องการ)
+    isTester: { type: Boolean, default: false },
 
     // FR-PROF-03 / FR-REV-03: คะแนนความน่าเชื่อถือ คำนวณจาก Feedback
     credibilityScore: { type: Number, default: 0, min: 0, max: 5 },
