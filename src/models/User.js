@@ -39,6 +39,8 @@ const userSchema = new mongoose.Schema(
     googleId: { type: String, default: null },
 
     isEmailVerified: { type: Boolean, default: false }, // FR-AUTH-04
+    emailVerificationToken: { type: String, default: null, select: false },
+    emailVerificationExpires: { type: Date, default: null, select: false },
     isProfileComplete: { type: Boolean, default: false }, // FR-AUTH-05
 
     // FR-PROF-01
