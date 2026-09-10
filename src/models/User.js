@@ -45,6 +45,7 @@ const userSchema = new mongoose.Schema(
 
     // FR-PROF-01
     fullName: { type: String, trim: true },
+    shortDescription: { type: String, trim: true, maxlength: 300 },
     avatarUrl: { type: String, default: null },
     phone: { type: String, trim: true },
     lineId: { type: String, trim: true },

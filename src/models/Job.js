@@ -25,6 +25,10 @@ const jobSchema = new mongoose.Schema(
     price: { type: Number, required: true, min: 0 },
     scheduledAt: { type: Date, required: true },
 
+    // FR-JOB-02: ช่วงเวลาที่ใช้ในการทำงาน แยกจากเวลานัดหมาย
+    durationStart: { type: String, trim: true },
+    durationEnd: { type: String, trim: true },
+
     // FR-JOB-03–06: ผลการกรองเนื้อหาอัตโนมัติ + การอนุมัติของ Admin
     contentFilterPassed: { type: Boolean, default: null },
     rejectionReason: { type: String, default: null },
