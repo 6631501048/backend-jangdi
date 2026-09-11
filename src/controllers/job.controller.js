@@ -11,31 +11,27 @@ const { notifyUser } = require("../services/notification.service");
  * POST /api/jobs
  * FR-JOB-01: สร้างประกาศงาน
  * FR-JOB-03/04: กรองเนื้อหาอัตโนมัติก่อนเข้าคิว Admin — ถ้าไม่ผ่านให้ reject ทันทีไม่ส่งต่อ Admin
- * body: { category, title, description, price, scheduledAt,durationStart, durationEnd, locationText, lat, lng,
+ * body: { category, title, description, price, scheduledAt, durationStart, durationEnd, locationText, lat, lng,
  *         fromText, toText, deliveryFee, notes }
  */
 const createJob = asyncHandler(async (req, res) => {
   const {
-    category, title, description, price, scheduledAt,durationStart,durationEnd,locationText, lat, lng,
+    category, title, description, price, scheduledAt, durationStart, durationEnd, locationText, lat, lng,
     fromText, toText, deliveryFee, notes,
   } = req.body;
 
   if (
-  !category ||
-  !title ||
-  !description ||
-  price == null ||
-  !scheduledAt ||
-  !durationStart ||
-  !durationEnd ||
-  lat == null ||
-  lng == null
-) {
-  return res.status(400).json({
-    message:
-      "กรุณากรอกข้อมูลให้ครบ (category, title, description, price, scheduledAt, durationStart, durationEnd, lat, lng)",
-  });
-}
+    !category || !title || !description || price == null || !scheduledAt ||
+    !durationStart || !durationEnd || lat == null || lng == null
+  ) {
+    return res.status(400).json({
+      message: "กรุณากรอกข้อมูลให้ครบ (category, title, description, price, scheduledAt, durationStart, durationEnd, lat, lng)",
+    });
+  }
+  if (new Date(durationEnd) <= new Date(durationStart)) {
+    return res.status(400).json({ message: "เวลาสิ้นสุดต้องอยู่หลังเวลาเริ่มต้น" });
+  }
+
   // FR-JOB-03: รันตัวกรองเนื้อหาอัตโนมัติกับ title + description
   const filterResult = checkContent(`${title} ${description}`);
 

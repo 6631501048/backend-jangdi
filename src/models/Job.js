@@ -26,8 +26,8 @@ const jobSchema = new mongoose.Schema(
     scheduledAt: { type: Date, required: true },
 
     // FR-JOB-02: ช่วงเวลาที่ใช้ในการทำงาน แยกจากเวลานัดหมาย
-    durationStart: { type: String, trim: true },
-    durationEnd: { type: String, trim: true },
+    durationStart: { type: Date, required: true },
+    durationEnd: { type: Date, required: true },
 
     // FR-JOB-03–06: ผลการกรองเนื้อหาอัตโนมัติ + การอนุมัติของ Admin
     contentFilterPassed: { type: Boolean, default: null },
