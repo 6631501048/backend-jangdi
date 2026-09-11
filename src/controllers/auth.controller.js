@@ -44,10 +44,10 @@ async function sendVerificationEmail(user) {
  * ลงทะเบียนด้วยอีเมล Lamduan + รหัสผ่าน แล้วส่งอีเมลยืนยัน (TODO: ต่อ email provider จริง)
  */
 const register = asyncHandler(async (req, res) => {
-  const { studentId, email, password } = req.body;
+  const { email, password } = req.body;
 
-  if (!studentId || !email || !password) {
-    return res.status(400).json({ message: "กรุณากรอก studentId, email และ password ให้ครบ" });
+  if (!email || !password) {
+    return res.status(400).json({ message: "กรุณากรอก email และ password ให้ครบ" });
   }
   if (!isLamduanEmail(email)) {
     return res.status(400).json({ message: "ต้องใช้อีเมล @lamduan.mfu.ac.th เท่านั้น" });
@@ -63,7 +63,7 @@ const register = asyncHandler(async (req, res) => {
 
   const hashed = await bcrypt.hash(password, 10);
   const user = await User.create({
-    studentId,
+    studentId: email.split("@")[0], // ล็อกจาก local-part ของอีเมล เสมอ ไม่รับค่าจาก client โดยตรง (กันปลอม ID)
     email: email.toLowerCase(),
     password: hashed,
   });

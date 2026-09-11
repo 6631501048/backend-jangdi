@@ -8,13 +8,20 @@ const { notifyUser } = require("../services/notification.service");
 /**
  * GET /api/payments/wallet — FR-PAY-08
  * สรุปยอดตาม state ของ Escrow (FR-PAY-02): pending / held (in progress) / released (available)
+ * มุมมองสลับตาม currentRole ของผู้ใช้ (บัญชีเดียวสลับ hirer/worker ได้ตาม FR-AUTH-06):
+ *   - worker: ดูเงินที่ตัวเอง "ได้รับ" (netAmountToWorker หลังหักค่าธรรมเนียม)
+ *   - hirer:  ดูเงินที่ตัวเอง "จ่ายออกไป" (amount เต็มก่อนหักค่าธรรมเนียม)
  * หมายเหตุ: "released" หมายถึงเงินที่ Admin โอนเข้าบัญชีธนาคารของ worker ไปแล้วจริง (FR-PAY-05)
- * ไม่ใช่ยอดเงินที่ค้างอยู่ใน wallet ของแอปที่ต้อง "ถอน" อีกขั้นหนึ่ง
+ * ไม่มี wallet กลางในแอปที่ต้อง "เติมเงิน" หรือ "ถอน" — ยึดตามระบบ escrow แบบ manual slip ใน proposal
  */
 const getWallet = asyncHandler(async (req, res) => {
+  const isHirer = req.user.currentRole === "hirer";
+  const matchField = isHirer ? "hirer" : "worker";
+  const sumField = isHirer ? "amount" : "netAmountToWorker";
+
   const rows = await Payment.aggregate([
-    { $match: { worker: req.user._id } },
-    { $group: { _id: "$status", total: { $sum: "$netAmountToWorker" } } },
+    { $match: { [matchField]: req.user._id } },
+    { $group: { _id: "$status", total: { $sum: `$${sumField}` } } },
   ]);
 
   const totals = { pending: 0, held: 0, released: 0 };
@@ -22,19 +29,29 @@ const getWallet = asyncHandler(async (req, res) => {
     if (r._id in totals) totals[r._id] = r.total;
   });
 
-  res.json({
-    availableBalance: totals.released, // โอนเข้าบัญชี worker แล้วจริง (FR-PAY-05)
-    pendingBalance: totals.pending, // รอผู้ว่าจ้างโอนเงินเข้า Escrow
-    inProgressBalance: totals.held, // อยู่ใน Escrow รอ Hirer ยืนยันงานเสร็จ
-  });
+  if (isHirer) {
+    res.json({
+      totalPaid: totals.released, // จ่ายออกไปจริงแล้ว (โอนเข้าบัญชี worker ตอน confirm-completion)
+      inEscrow: totals.held, // อยู่ใน Escrow รองาน worker ทำเสร็จ+ยืนยัน
+      pendingPayment: totals.pending, // เลือก worker แล้วแต่ยังไม่มีสลิปโอนเข้า Escrow (FR-PAY-04)
+    });
+  } else {
+    res.json({
+      availableBalance: totals.released, // โอนเข้าบัญชี worker แล้วจริง (FR-PAY-05)
+      pendingBalance: totals.pending, // รอผู้ว่าจ้างโอนเงินเข้า Escrow
+      inProgressBalance: totals.held, // อยู่ใน Escrow รอ Hirer ยืนยันงานเสร็จ
+    });
+  }
 });
 
 /**
  * GET /api/payments/summary?period=month|last-month|all — FR-PAY-08
+ * worker เห็น totalEarnings, hirer เห็น totalSpent
  */
 const getSummary = asyncHandler(async (req, res) => {
+  const isHirer = req.user.currentRole === "hirer";
   const { period = "all" } = req.query;
-  const match = { worker: req.user._id, status: "released" };
+  const match = { [isHirer ? "hirer" : "worker"]: req.user._id, status: "released" };
 
   const now = new Date();
   if (period === "month") {
@@ -47,32 +64,34 @@ const getSummary = asyncHandler(async (req, res) => {
   }
 
   const payments = await Payment.find(match);
-  const totalEarnings = payments.reduce((sum, p) => sum + p.netAmountToWorker, 0);
 
-  res.json({
-    totalEarnings,
-    completeJobs: payments.length,
-    averageRating: req.user.credibilityScore,
-  });
+  if (isHirer) {
+    const totalSpent = payments.reduce((sum, p) => sum + p.amount, 0);
+    res.json({ totalSpent, completeJobs: payments.length });
+  } else {
+    const totalEarnings = payments.reduce((sum, p) => sum + p.netAmountToWorker, 0);
+    res.json({ totalEarnings, completeJobs: payments.length, averageRating: req.user.credibilityScore });
+  }
 });
 
 /**
  * GET /api/payments/transactions?limit=20 — FR-PAY-08
- * ประวัติเงินที่ได้รับจาก Escrow (released) เรียงล่าสุดก่อน
+ * worker: ประวัติเงินที่ได้รับ (received) / hirer: ประวัติเงินที่จ่ายออก (paid) — เรียงล่าสุดก่อน
  */
 const getTransactions = asyncHandler(async (req, res) => {
+  const isHirer = req.user.currentRole === "hirer";
   const limit = Math.min(Number(req.query.limit) || 20, 100);
 
-  const payments = await Payment.find({ worker: req.user._id, status: "released" })
+  const payments = await Payment.find({ [isHirer ? "hirer" : "worker"]: req.user._id, status: "released" })
     .populate("job", "title")
     .sort({ releasedAt: -1 })
     .limit(limit);
 
   const transactions = payments.map((p) => ({
     id: p._id,
-    type: "received", // เงินที่ได้รับจาก Escrow ไม่ใช่ "withdraw" (ดูหมายเหตุใน getWallet)
+    type: isHirer ? "paid" : "received",
     jobTitle: p.job?.title || "-",
-    amount: p.netAmountToWorker,
+    amount: isHirer ? p.amount : p.netAmountToWorker,
     date: p.releasedAt,
   }));
 
