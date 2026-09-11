@@ -1,9 +1,11 @@
 const asyncHandler = require("express-async-handler");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const { OAuth2Client } = require("google-auth-library");
 const { User } = require("../models");
 const { isLamduanEmail } = require("../utils/validators");
+const { sendEmail } = require("../utils/mailer");
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -17,7 +19,24 @@ function signToken(userId) {
 function sanitizeUser(user) {
   const obj = user.toObject ? user.toObject() : user;
   delete obj.password;
+  delete obj.emailVerificationToken;
+  delete obj.emailVerificationExpires;
   return obj;
+}
+
+/** สร้าง token ยืนยันอีเมล + ส่งอีเมลจริง (FR-AUTH-04, FR-NOTIF-01) */
+async function sendVerificationEmail(user) {
+  const token = crypto.randomBytes(32).toString("hex");
+  user.emailVerificationToken = token;
+  user.emailVerificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 ชั่วโมง
+  await user.save();
+
+  const verifyUrl = `${process.env.CLIENT_URL || "http://localhost:5173"}/verify-email?token=${token}`;
+  await sendEmail({
+    to: user.email,
+    subject: "ยืนยันอีเมลของคุณ - JangDi",
+    html: `<p>คลิกลิงก์นี้เพื่อยืนยันอีเมลของคุณ (ลิงก์หมดอายุใน 24 ชั่วโมง):</p><p><a href="${verifyUrl}">${verifyUrl}</a></p>`,
+  });
 }
 
 /**
@@ -49,9 +68,10 @@ const register = asyncHandler(async (req, res) => {
     password: hashed,
   });
 
-  // TODO: ส่งอีเมลยืนยัน (FR-AUTH-04) ผ่าน provider ที่เลือกใช้จริง
+  await sendVerificationEmail(user); // FR-AUTH-04, FR-NOTIF-01
+
   res.status(201).json({
-    message: "ลงทะเบียนสำเร็จ",
+    message: "ลงทะเบียนสำเร็จ กรุณายืนยันอีเมลก่อนใช้งาน",
     token: signToken(user._id),
     user: sanitizeUser(user),
   });
@@ -156,4 +176,35 @@ const changePassword = asyncHandler(async (req, res) => {
   res.json({ message: "เปลี่ยนรหัสผ่านสำเร็จ" });
 });
 
-module.exports = { register, login, googleLogin, getMe, switchRole, changePassword };
+/** GET /api/auth/verify-email?token=... — FR-AUTH-04 */
+const verifyEmail = asyncHandler(async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ message: "ไม่พบ token ยืนยัน" });
+
+  const user = await User.findOne({
+    emailVerificationToken: token,
+    emailVerificationExpires: { $gt: new Date() },
+  }).select("+emailVerificationToken +emailVerificationExpires");
+
+  if (!user) {
+    return res.status(400).json({ message: "ลิงก์ยืนยันไม่ถูกต้องหรือหมดอายุแล้ว" });
+  }
+
+  user.isEmailVerified = true;
+  user.emailVerificationToken = null;
+  user.emailVerificationExpires = null;
+  await user.save();
+
+  res.json({ message: "ยืนยันอีเมลสำเร็จ" });
+});
+
+/** POST /api/auth/resend-verification — ส่งอีเมลยืนยันซ้ำ (กรณีลิงก์เดิมหมดอายุ) */
+const resendVerification = asyncHandler(async (req, res) => {
+  if (req.user.isEmailVerified) {
+    return res.status(400).json({ message: "อีเมลนี้ยืนยันแล้ว" });
+  }
+  await sendVerificationEmail(req.user);
+  res.json({ message: "ส่งอีเมลยืนยันใหม่แล้ว กรุณาตรวจสอบกล่องจดหมาย" });
+});
+
+module.exports = { register, login, googleLogin, getMe, switchRole, changePassword, verifyEmail, resendVerification };

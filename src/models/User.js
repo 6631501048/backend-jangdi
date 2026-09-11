@@ -39,10 +39,13 @@ const userSchema = new mongoose.Schema(
     googleId: { type: String, default: null },
 
     isEmailVerified: { type: Boolean, default: false }, // FR-AUTH-04
+    emailVerificationToken: { type: String, default: null, select: false },
+    emailVerificationExpires: { type: Date, default: null, select: false },
     isProfileComplete: { type: Boolean, default: false }, // FR-AUTH-05
 
     // FR-PROF-01
     fullName: { type: String, trim: true },
+    shortDescription: { type: String, trim: true, maxlength: 300 },
     avatarUrl: { type: String, default: null },
     phone: { type: String, trim: true },
     lineId: { type: String, trim: true },

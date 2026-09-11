@@ -1,13 +1,21 @@
-const { Notification } = require("../models");
+const { Notification, User } = require("../models");
+const { sendEmail } = require("../utils/mailer");
 
 /**
- * สร้าง Notification ในฐานข้อมูล + ส่งแบบเรียลไทม์ผ่าน Socket.IO (FR-NOTIF-01, FR-NOTIF-03)
- * อีเมลสำรอง (FR-NOTIF-02) ยังเป็น TODO — ต่อ provider จริงตอน implement
+ * ประเภทการแจ้งเตือนที่ต้องส่งอีเมลเป็น "ช่องทางหลัก" ตาม FR-NOTIF-01
+ * (Objective 1.2.2 ของ proposal ระบุอีเมลเป็นกลไกหลักสำหรับแจ้งงานใหม่ใกล้เคียง)
+ */
+const EMAIL_PRIMARY_TYPES = ["new_nearby_job"];
+
+/**
+ * สร้าง Notification ในฐานข้อมูล + ส่งแบบเรียลไทม์ผ่าน Socket.IO (FR-NOTIF-02, ช่องทางเสริม)
+ * + ส่งอีเมลจริงเป็นช่องทางหลักสำหรับ type ที่อยู่ใน EMAIL_PRIMARY_TYPES (FR-NOTIF-01)
  *
  * @param {import("socket.io").Server} io
  * @param {object} params
+ * @param {boolean} [params.forceEmail] บังคับส่งอีเมลแม้ type จะไม่อยู่ใน EMAIL_PRIMARY_TYPES (เช่น ใช้กับการยืนยันบัญชี)
  */
-async function notifyUser(io, { userId, type, title, message, relatedEntityType, relatedEntityId }) {
+async function notifyUser(io, { userId, type, title, message, relatedEntityType, relatedEntityId, forceEmail }) {
   const notif = await Notification.create({
     user: userId,
     type,
@@ -17,6 +25,7 @@ async function notifyUser(io, { userId, type, title, message, relatedEntityType,
     relatedEntityId: relatedEntityId || null,
   });
 
+  // FR-NOTIF-02: ช่องทางเสริมแบบเรียลไทม์สำหรับผู้ใช้ที่ออนไลน์อยู่
   if (io) {
     io.to(`user:${userId}`).emit("notification", {
       _id: notif._id,
@@ -28,7 +37,22 @@ async function notifyUser(io, { userId, type, title, message, relatedEntityType,
     });
   }
 
-  // TODO (FR-NOTIF-02): ถ้าผู้ใช้ไม่ online (ไม่มี socket ใน room) ให้ส่งอีเมลสำรองแทน
+  // FR-NOTIF-01: อีเมลเป็นช่องทางหลัก สำหรับแจ้งงานใหม่ใกล้เคียง (ตาม Objective 1.2.2)
+  if (forceEmail || EMAIL_PRIMARY_TYPES.includes(type)) {
+    const user = await User.findById(userId).select("email");
+    if (user?.email) {
+      const result = await sendEmail({
+        to: user.email,
+        subject: title,
+        html: `<p>${message}</p>`,
+      });
+      if (result.sent) {
+        notif.sentViaEmail = true;
+        await notif.save();
+      }
+    }
+  }
+
   return notif;
 }
 

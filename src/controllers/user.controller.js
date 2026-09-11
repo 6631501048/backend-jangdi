@@ -26,9 +26,10 @@ const updateProfile = asyncHandler(async (req, res) => {
   const user = await User.findById(req.params.id);
   if (!user) return res.status(404).json({ message: "ไม่พบผู้ใช้นี้" });
 
-  const { fullName, phone, lineId, facebook, instagram, avatarUrl, bankAccount, contactAddress, lat, lng } = req.body;
+  const { fullName, shortDescription, phone, lineId, facebook, instagram, avatarUrl, bankAccount, contactAddress, lat, lng } = req.body;
 
   if (fullName !== undefined) user.fullName = fullName;
+  if (shortDescription !== undefined) user.shortDescription = shortDescription;
   if (phone !== undefined) user.phone = phone;
   if (lineId !== undefined) user.lineId = lineId;
   if (facebook !== undefined) user.facebook = facebook;
