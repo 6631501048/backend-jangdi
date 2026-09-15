@@ -22,14 +22,13 @@ const createJob = asyncHandler(async (req, res) => {
 
   if (
     !category || !title || !description || price == null || !scheduledAt ||
-    lat == null || lng == null
+    !durationStart || !durationEnd || lat == null || lng == null
   ) {
     return res.status(400).json({
-      message: "กรุณากรอกข้อมูลให้ครบ (category, title, description, price, scheduledAt, lat, lng)",
+      message: "กรุณากรอกข้อมูลให้ครบ (category, title, description, price, scheduledAt, durationStart, durationEnd, lat, lng)",
     });
   }
-  // durationStart/durationEnd ไม่บังคับกรอก (null ได้) — เช็คลำดับเวลาเฉพาะตอนที่ส่งมาทั้งคู่
-  if (durationStart && durationEnd && new Date(durationEnd) <= new Date(durationStart)) {
+  if (new Date(durationEnd) <= new Date(durationStart)) {
     return res.status(400).json({ message: "เวลาสิ้นสุดต้องอยู่หลังเวลาเริ่มต้น" });
   }
 
