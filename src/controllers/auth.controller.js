@@ -24,19 +24,28 @@ function sanitizeUser(user) {
   return obj;
 }
 
-/** สร้าง token ยืนยันอีเมล + ส่งอีเมลจริง (FR-AUTH-04, FR-NOTIF-01) */
+const VERIFY_TTL_MS = 24 * 60 * 60 * 1000; // ลิงก์ยืนยันอายุ 24 ชั่วโมง
+const RESEND_COOLDOWN_MS = 60 * 1000; // กดขอส่งซ้ำได้ทุก 60 วินาที (กันสแปมอีเมล)
+
+/** สร้าง token ยืนยันอีเมล + ส่งอีเมลจริง (FR-AUTH-04, FR-NOTIF-01) คืน { sent } ว่าส่งออกจริงหรือไม่ */
 async function sendVerificationEmail(user) {
   const token = crypto.randomBytes(32).toString("hex");
   user.emailVerificationToken = token;
-  user.emailVerificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 ชั่วโมง
+  user.emailVerificationExpires = new Date(Date.now() + VERIFY_TTL_MS);
   await user.save();
 
   const verifyUrl = `${process.env.CLIENT_URL || "http://localhost:5173"}/verify-email?token=${token}`;
-  await sendEmail({
+  const result = await sendEmail({
     to: user.email,
     subject: "ยืนยันอีเมลของคุณ - JangDi",
     html: `<p>คลิกลิงก์นี้เพื่อยืนยันอีเมลของคุณ (ลิงก์หมดอายุใน 24 ชั่วโมง):</p><p><a href="${verifyUrl}">${verifyUrl}</a></p>`,
   });
+
+  // dev ที่ยังไม่ตั้ง SMTP: พิมพ์ลิงก์ลง console เพื่อให้ทดสอบ flow ได้ (ไม่พิมพ์ใน production)
+  if (!result.sent && process.env.NODE_ENV !== "production") {
+    console.log(`[dev] SMTP ไม่พร้อม — ลิงก์ยืนยันของ ${user.email}: ${verifyUrl}`);
+  }
+  return result;
 }
 
 /**
@@ -68,10 +77,11 @@ const register = asyncHandler(async (req, res) => {
     password: hashed,
   });
 
-  await sendVerificationEmail(user); // FR-AUTH-04, FR-NOTIF-01
+  const mail = await sendVerificationEmail(user); // FR-AUTH-04, FR-NOTIF-01
 
   res.status(201).json({
     message: "ลงทะเบียนสำเร็จ กรุณายืนยันอีเมลก่อนใช้งาน",
+    emailSent: mail.sent,
     token: signToken(user._id),
     user: sanitizeUser(user),
   });
@@ -200,11 +210,33 @@ const verifyEmail = asyncHandler(async (req, res) => {
 
 /** POST /api/auth/resend-verification — ส่งอีเมลยืนยันซ้ำ (กรณีลิงก์เดิมหมดอายุ) */
 const resendVerification = asyncHandler(async (req, res) => {
-  if (req.user.isEmailVerified) {
+  // req.user จาก protect ไม่ได้ select emailVerificationExpires (select:false) จึงโหลดใหม่
+  const user = await User.findById(req.user._id).select("+emailVerificationExpires");
+  if (user.isEmailVerified) {
     return res.status(400).json({ message: "อีเมลนี้ยืนยันแล้ว" });
   }
-  await sendVerificationEmail(req.user);
-  res.json({ message: "ส่งอีเมลยืนยันใหม่แล้ว กรุณาตรวจสอบกล่องจดหมาย" });
+
+  // เวลาที่ส่งล่าสุด = เวลาหมดอายุ - TTL (ไม่ต้องเพิ่ม field ใน schema)
+  const lastSentAt = user.emailVerificationExpires
+    ? user.emailVerificationExpires.getTime() - VERIFY_TTL_MS
+    : 0;
+  const waitMs = lastSentAt + RESEND_COOLDOWN_MS - Date.now();
+  if (waitMs > 0) {
+    const retryAfterSeconds = Math.ceil(waitMs / 1000);
+    return res.status(429).json({
+      message: `ส่งอีเมลไปเมื่อสักครู่ กรุณารออีก ${retryAfterSeconds} วินาที`,
+      retryAfterSeconds,
+    });
+  }
+
+  const mail = await sendVerificationEmail(user);
+  res.json({
+    message: mail.sent
+      ? "ส่งอีเมลยืนยันใหม่แล้ว กรุณาตรวจสอบกล่องจดหมาย (รวมถึงโฟลเดอร์สแปม)"
+      : "ระบบส่งอีเมลยังไม่พร้อม กรุณาติดต่อผู้ดูแลระบบ",
+    emailSent: mail.sent,
+    retryAfterSeconds: RESEND_COOLDOWN_MS / 1000,
+  });
 });
 
 module.exports = { register, login, googleLogin, getMe, switchRole, changePassword, verifyEmail, resendVerification };

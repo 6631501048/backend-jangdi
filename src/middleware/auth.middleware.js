@@ -47,4 +47,17 @@ function requireRole(role) {
   };
 }
 
-module.exports = { protect, adminOnly, requireRole };
+/**
+ * บังคับยืนยันอีเมลก่อนทำ action ที่ผูกมัด (โพสต์งาน / สมัครงาน / เลือก worker / Service Post)
+ * ใช้ต่อท้าย protect เสมอ  Admin ข้ามได้ (บัญชี admin สร้างผ่านสคริปต์ อาจไม่เคยยืนยันอีเมล)
+ * frontend ดักที่ code === "EMAIL_NOT_VERIFIED" เพื่อพาไปหน้าส่งอีเมลยืนยันใหม่
+ */
+function requireVerifiedEmail(req, res, next) {
+  if (req.user?.isEmailVerified || req.user?.isAdmin) return next();
+  return res.status(403).json({
+    code: "EMAIL_NOT_VERIFIED",
+    message: "กรุณายืนยันอีเมลก่อนใช้งานฟังก์ชันนี้",
+  });
+}
+
+module.exports = { protect, adminOnly, requireRole, requireVerifiedEmail };
