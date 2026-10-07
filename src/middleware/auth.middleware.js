@@ -19,7 +19,7 @@ async function protect(req, res, next) {
       return res.status(401).json({ message: "ไม่พบบัญชีผู้ใช้นี้" });
     }
     if (user.accountStatus === "suspended") {
-      return res.status(403).json({ message: "บัญชีนี้ถูกระงับการใช้งาน" });
+      return res.status(403).json({ code: "ACCOUNT_SUSPENDED", message: "บัญชีนี้ถูกระงับการใช้งาน" });
     }
 
     req.user = user;

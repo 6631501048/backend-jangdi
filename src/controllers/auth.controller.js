@@ -98,6 +98,9 @@ const login = asyncHandler(async (req, res) => {
   if (!match) {
     return res.status(401).json({ message: "อีเมลหรือรหัสผ่านไม่ถูกต้อง" });
   }
+  if (user.accountStatus === "suspended") {
+    return res.status(403).json({ code: "ACCOUNT_SUSPENDED", message: "บัญชีนี้ถูกระงับการใช้งาน กรุณาติดต่อผู้ดูแลระบบ" });
+  }
   res.json({
     token: signToken(user._id),
     user: sanitizeUser(user),
@@ -137,6 +140,10 @@ const googleLogin = asyncHandler(async (req, res) => {
     await user.save();
   }
 
+  if (user.accountStatus === "suspended") {
+    return res.status(403).json({ code: "ACCOUNT_SUSPENDED", message: "บัญชีนี้ถูกระงับการใช้งาน กรุณาติดต่อผู้ดูแลระบบ" });
+  }
+
   // FR-AUTH-05: ถ้าเป็นผู้ใช้ใหม่/ยังกรอกโปรไฟล์ไม่ครบ ให้ frontend พาไปหน้ากรอกโปรไฟล์ต่อ
   res.json({
     token: signToken(user._id),
@@ -153,6 +160,9 @@ const getMe = asyncHandler(async (req, res) => {
 /** PATCH /api/auth/role  — FR-AUTH-06: สลับบทบาท Hirer/Worker */
 const switchRole = asyncHandler(async (req, res) => {
   const { role } = req.body;
+  if (req.user.isAdmin) {
+    return res.status(403).json({ message: "บัญชีผู้ดูแลระบบไม่มีบทบาท Hirer/Worker" });
+  }
   if (!["hirer", "worker"].includes(role)) {
     return res.status(400).json({ message: "role ต้องเป็น hirer หรือ worker เท่านั้น" });
   }
