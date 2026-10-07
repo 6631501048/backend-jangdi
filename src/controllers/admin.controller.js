@@ -132,7 +132,8 @@ const getDashboard = asyncHandler(async (req, res) => {
  */
 const getUsers = asyncHandler(async (req, res) => {
   const { role, search } = req.query;
-  const query = {};
+  // บัญชี Admin ไม่ใช่ Hirer/Worker -> ไม่แสดงในรายการจัดการผู้ใช้ (กัน Admin ถูกระงับ/เตือนจากหน้านี้)
+  const query = { isAdmin: { $ne: true } };
   if (role) query.currentRole = role;
   if (search) {
     query.$or = [
@@ -154,8 +155,22 @@ const updateUserStatus = asyncHandler(async (req, res) => {
   const statusMap = { warn: "warned", suspend: "suspended", clear: "active" };
   if (!statusMap[action]) return res.status(400).json({ message: "action ต้องเป็น warn, suspend หรือ clear" });
 
-  const user = await User.findByIdAndUpdate(req.params.id, { accountStatus: statusMap[action] }, { new: true }).select("-password");
-  if (!user) return res.status(404).json({ message: "ไม่พบผู้ใช้นี้" });
+  // กัน Admin ระงับ/เตือนตัวเอง (ไม่งั้นโดนล็อกออกจากระบบทันที)
+  if (String(req.params.id) === String(req.user._id)) {
+    return res.status(400).json({ message: "ไม่สามารถเปลี่ยนสถานะบัญชีของตัวเองได้" });
+  }
+
+  const target = await User.findById(req.params.id);
+  if (!target) return res.status(404).json({ message: "ไม่พบผู้ใช้นี้" });
+  // FR-ADMIN-03 ใช้จัดการ Hirer/Worker เท่านั้น ไม่ให้แตะบัญชี Admin ด้วยกัน
+  if (target.isAdmin) {
+    return res.status(403).json({ message: "ไม่สามารถเปลี่ยนสถานะบัญชีผู้ดูแลระบบได้" });
+  }
+
+  target.accountStatus = statusMap[action];
+  await target.save();
+  const user = target.toObject();
+  delete user.password;
 
   await notifyUser(req.app.get("io"), {
     userId: user._id,
