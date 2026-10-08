@@ -1,4 +1,4 @@
-const asyncHandler = require("express-async-handler");
+﻿const asyncHandler = require("express-async-handler");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
@@ -22,14 +22,23 @@ const createJob = asyncHandler(async (req, res) => {
 
   if (
     !category || !title || !description || price == null || !scheduledAt ||
-    !durationStart || !durationEnd || lat == null || lng == null
+    lat == null || lng == null
   ) {
     return res.status(400).json({
-      message: "กรุณากรอกข้อมูลให้ครบ (category, title, description, price, scheduledAt, durationStart, durationEnd, lat, lng)",
+      message: "กรุณากรอกข้อมูลให้ครบ (category, title, description, price, scheduledAt, lat, lng)",
     });
   }
-  if (new Date(durationEnd) <= new Date(durationStart)) {
-    return res.status(400).json({ message: "เวลาสิ้นสุดต้องอยู่หลังเวลาเริ่มต้น" });
+  const hasDurationStart = durationStart != null && durationStart !== "";
+  const hasDurationEnd = durationEnd != null && durationEnd !== "";
+  if (hasDurationStart !== hasDurationEnd) {
+    return res.status(400).json({ message: "กรุณาระบุเวลาเริ่มต้นและเวลาสิ้นสุดให้ครบ หรือเว้นว่างทั้งคู่" });
+  }
+  if (hasDurationStart) {
+    const startTime = new Date(durationStart).getTime();
+    const endTime = new Date(durationEnd).getTime();
+    if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || endTime <= startTime) {
+      return res.status(400).json({ message: "เวลาสิ้นสุดต้องอยู่หลังเวลาเริ่มต้น" });
+    }
   }
 
   // FR-JOB-03: รันตัวกรองเนื้อหาอัตโนมัติกับ title + description
@@ -108,6 +117,15 @@ const cancelJob = asyncHandler(async (req, res) => {
   if (!job) return res.status(404).json({ message: "ไม่พบประกาศงานนี้" });
   if (String(job.hirer) !== String(req.user._id)) {
     return res.status(403).json({ message: "คุณไม่ใช่เจ้าของประกาศงานนี้" });
+  }
+  if (req.body?.expiredNoApplicants === true) {
+    if (job.status !== "waiting" || new Date(job.scheduledAt).getTime() >= Date.now()) {
+      return res.status(400).json({ message: "ยกเลิกได้เมื่องานเลยเวลานัดแล้วเท่านั้น" });
+    }
+    const applicantCount = await JobWaiting.countDocuments({ job: job._id, status: "waiting" });
+    if (applicantCount > 0) {
+      return res.status(400).json({ message: "งานนี้ยังมีผู้สมัคร ไม่สามารถยกเลิกด้วยเหตุหมดเวลาได้" });
+    }
   }
   if (["completed", "cancelled"].includes(job.status)) {
     return res.status(400).json({ message: `ไม่สามารถยกเลิกงานที่มีสถานะ ${job.status} ได้` });
@@ -424,3 +442,6 @@ module.exports = {
   createJob, getMyJobs, getJobById, cancelJob,
   getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion,
 };
+
+
+

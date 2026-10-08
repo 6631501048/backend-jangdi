@@ -1,4 +1,4 @@
-const mongoose = require("mongoose");
+﻿const mongoose = require("mongoose");
 
 /**
  * JOB
@@ -26,8 +26,8 @@ const jobSchema = new mongoose.Schema(
     scheduledAt: { type: Date, required: true },
 
     // FR-JOB-02: ช่วงเวลาที่ใช้ในการทำงาน แยกจากเวลานัดหมาย — ไม่บังคับกรอก (null ได้ถ้าไม่ระบุ)
-    durationStart: { type: Date, required: true },
-    durationEnd: { type: Date, required: true },
+    durationStart: { type: Date, default: null },
+    durationEnd: { type: Date, default: null },
 
     // FR-JOB-03–06: ผลการกรองเนื้อหาอัตโนมัติ + การอนุมัติของ Admin
     contentFilterPassed: { type: Boolean, default: null },
