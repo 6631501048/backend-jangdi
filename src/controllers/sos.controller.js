@@ -17,11 +17,19 @@ const createSos = asyncHandler(async (req, res) => {
   if (String(job.selectedWorker) !== String(req.user._id)) {
     return res.status(403).json({ message: "คุณไม่ใช่ผู้รับจ้างของงานนี้" });
   }
+  if (!["assigned", "in_progress", "awaiting_confirmation"].includes(job.status)) {
+    return res.status(409).json({ message: "สามารถส่ง SOS ได้เฉพาะงานที่กำลังดำเนินการ" });
+  }
+  const latitude = Number(lat);
+  const longitude = Number(lng);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
+    return res.status(400).json({ message: "พิกัดตำแหน่งไม่ถูกต้อง" });
+  }
 
   const sos = await Sos.create({
     worker: req.user._id,
     job: job._id,
-    location: { type: "Point", coordinates: [Number(lng), Number(lat)] },
+    location: { type: "Point", coordinates: [longitude, latitude] },
   });
 
   // FR-SOS-03: แจ้ง Admin ทุกคนทันที (fire-and-forget เพื่อไม่ให้ response ช้า — ต้องถึงภายใน 1 นาทีตาม NFR-PERF-02)

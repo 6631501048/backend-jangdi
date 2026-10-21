@@ -1,7 +1,7 @@
 const router = require("express").Router();
 const { protect, requireRole, requireVerifiedEmail } = require("../middleware/auth.middleware");
 const {
-  createJob, getMyJobs, getJobById, cancelJob,
+  createJob, getMyJobs, getJobById, getJobTimeline, cancelJob,
   getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion, getCompletionProof,
 } = require("../controllers/job.controller");
 const { submitReview } = require("../controllers/review.controller");
@@ -13,6 +13,7 @@ router.get("/my-as-worker", protect, requireRole("worker"), getMyWorkerJobs); //
 router.post("/", protect, requireRole("hirer"), requireVerifiedEmail, createJob); // FR-JOB-01–05
 
 router.get("/:id", protect, getJobById); // FR-BROWSE-03
+router.get("/:id/timeline", protect, getJobTimeline); // job status audit timestamps
 router.post("/:id/apply", protect, requireRole("worker"), requireVerifiedEmail, applyToJob); // FR-BROWSE-04–06
 router.get("/:id/applicants", protect, requireRole("hirer"), getApplicants); // FR-MATCH-03
 router.post("/:id/select-worker", protect, requireRole("hirer"), requireVerifiedEmail, selectWorker); // FR-MATCH-04–06, FR-PAY-01

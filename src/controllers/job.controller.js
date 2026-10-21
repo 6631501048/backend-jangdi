@@ -1,10 +1,10 @@
-﻿const asyncHandler = require("express-async-handler");
+const asyncHandler = require("express-async-handler");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const { randomUUID } = require("crypto");
 const { detectProofImage } = require("../utils/proofImage");
-const { Job, JobWaiting, Payment } = require("../models");
+const { Job, JobWaiting, Payment, JobLog } = require("../models");
 const { checkContent } = require("../utils/contentFilter");
 const { logJobStatusChange } = require("../services/jobLog.service");
 const { notifyUser } = require("../services/notification.service");
@@ -104,6 +104,21 @@ const getMyJobs = asyncHandler(async (req, res) => {
   res.json(jobs);
 });
 
+/** GET /api/jobs/:id/timeline — real audit timestamps, limited to the job participants. */
+const getJobTimeline = asyncHandler(async (req, res) => {
+  const job = await Job.findById(req.params.id);
+  if (!job) return res.status(404).json({ message: "ไม่พบงานนี้" });
+  const userId = String(req.user._id);
+  if (!req.user.isAdmin && userId !== String(job.hirer) && userId !== String(job.selectedWorker)) {
+    return res.status(403).json({ message: "ไม่มีสิทธิ์ดูประวัติสถานะงานนี้" });
+  }
+  const logs = await JobLog.find({ job: job._id }).sort({ createdAt: 1 });
+  res.json(logs.map((log) => ({
+    status: log.newStatus,
+    at: log.createdAt,
+  })));
+});
+
 /** GET /api/jobs/:id — FR-BROWSE-03 (ดูรายละเอียดงาน) */
 const getJobById = asyncHandler(async (req, res) => {
   const job = await Job.findById(req.params.id).populate("hirer", "fullName avatarUrl credibilityScore");
@@ -130,28 +145,32 @@ const cancelJob = asyncHandler(async (req, res) => {
       return res.status(400).json({ message: "งานนี้ยังมีผู้สมัคร ไม่สามารถยกเลิกด้วยเหตุหมดเวลาได้" });
     }
   }
-  if (["completed", "cancelled"].includes(job.status)) {
-    return res.status(400).json({ message: `ไม่สามารถยกเลิกงานที่มีสถานะ ${job.status} ได้` });
+  // MVP: allow direct cancellation only before assigning a Worker.
+  // Cancelling an active job with held demo payment requires the later dispute/refund flow.
+  if (!["pending_review", "waiting"].includes(job.status)) {
+    return res.status(409).json({ message: "งานนี้เลือก Worker แล้วหรือปิดงานไปแล้ว กรุณาติดต่อผู้ดูแลเพื่อดำเนินการยกเลิก" });
   }
 
   const previousStatus = job.status;
-  job.status = "cancelled";
-  job.cancelledAt = new Date();
-  job.cancelReason = req.body?.reason || null;
-  await job.save();
+  const cancelled = await Job.findOneAndUpdate(
+    { _id: job._id, hirer: req.user._id, status: previousStatus },
+    { $set: { status: "cancelled", cancelledAt: new Date(), cancelReason: req.body?.reason?.trim() || null } },
+    { new: true, runValidators: true }
+  );
+  if (!cancelled) return res.status(409).json({ message: "สถานะงานเปลี่ยนไปแล้ว กรุณาโหลดหน้าใหม่" });
 
   await logJobStatusChange({
-    jobId: job._id,
+    jobId: cancelled._id,
     previousStatus,
     newStatus: "cancelled",
     changedBy: req.user._id,
-    note: job.cancelReason,
+    note: cancelled.cancelReason,
   });
 
   // TODO (FR-JOB-07 / FR-PAY-06,07): ถ้ามีเงินพักใน Escrow (Payment.status === "held")
   // ให้สร้าง refund request ที่นี่ ต่อเมื่อ implement payment.controller.js
 
-  res.json({ message: "ยกเลิกประกาศงานสำเร็จ", job });
+  res.json({ message: "ยกเลิกประกาศงานสำเร็จ", job: cancelled });
 });
 
 /**
@@ -260,9 +279,13 @@ const selectWorker = asyncHandler(async (req, res) => {
   if (!chosen) return res.status(404).json({ message: "ไม่พบผู้สมัครคนนี้ในคิวของงานนี้" });
 
   const previousStatus = job.status;
-  job.status = "assigned";
-  job.selectedWorker = workerId;
-  await job.save();
+  // Atomic selection so a cancellation or another selection cannot race with this action.
+  const assignedJob = await Job.findOneAndUpdate(
+    { _id: job._id, hirer: req.user._id, status: "waiting" },
+    { $set: { status: "assigned", selectedWorker: workerId } },
+    { new: true, runValidators: true }
+  );
+  if (!assignedJob) return res.status(409).json({ message: "งานนี้ถูกเลือก Worker หรือยกเลิกไปแล้ว กรุณาโหลดหน้าใหม่" });
 
   // FR-MATCH-05: ทำเครื่องหมายผู้สมัครรายอื่นทั้งหมดเป็น "ไม่ได้รับเลือก"
   await JobWaiting.updateMany({ job: job._id, worker: { $ne: workerId } }, { status: "not_selected" });
@@ -305,7 +328,7 @@ const selectWorker = asyncHandler(async (req, res) => {
     relatedEntityId: job._id,
   });
 
-  res.json({ message: "เลือกผู้รับจ้างสำเร็จ", job });
+  res.json({ message: "เลือกผู้รับจ้างสำเร็จ", job: assignedJob });
 });
 
 /**
@@ -315,26 +338,45 @@ const selectWorker = asyncHandler(async (req, res) => {
 const getMyWorkerJobs = asyncHandler(async (req, res) => {
   const { status = "waiting" } = req.query;
 
-  if (status === "waiting") {
-    // ใบสมัครที่ยังรออยู่ในคิว ยังไม่ถูกเลือก (FR-BROWSE-07)
-    const applications = await JobWaiting.find({ worker: req.user._id, status: "waiting" })
-      .populate("job")
+  // Keep the waiting list free of cancelled / closed posts. Cancelled jobs
+  // remain visible in their own tab for Workers who applied before selection.
+  if (status === "waiting" || status === "cancelled") {
+    const applications = await JobWaiting.find({ worker: req.user._id })
+      .populate({ path: "job", populate: { path: "hirer", select: "fullName avatarUrl" } })
       .sort({ createdAt: -1 });
 
-    const result = applications
-      .filter((a) => a.job) // กันกรณีงานถูกลบไปแล้ว
-      .map((a) => ({
-        id: a.job._id,
-        status: "waiting",
-        title: a.job.title,
-        hirerName: null,
-        price: a.job.price,
-        category: a.job.category,
-      }));
-    return res.json(result);
+    if (status === "waiting") {
+      return res.json(applications
+        .filter((a) => a.status === "waiting" && a.job?.status === "waiting")
+        .map((a) => ({
+          id: a.job._id, status: "waiting", backendStatus: "waiting",
+          title: a.job.title, hirerName: a.job.hirer?.fullName || null,
+          price: a.job.price, category: a.job.category, scheduledAt: a.job.scheduledAt,
+        })));
+    }
+
+    // Cancelled after assignment OR after application are both legitimate
+    // cancelled jobs for that Worker. One job appears only once.
+    const cancelledJobs = await Job.find({ selectedWorker: req.user._id, status: "cancelled" })
+      .populate("hirer", "fullName avatarUrl");
+    const byId = new Map();
+    for (const j of cancelledJobs) byId.set(String(j._id), j);
+    for (const a of applications) {
+      if (a.job?.status === "cancelled") byId.set(String(a.job._id), a.job);
+    }
+    return res.json(Array.from(byId.values())
+      .sort((a, b) => new Date(b.cancelledAt || b.updatedAt) - new Date(a.cancelledAt || a.updatedAt))
+      .map((j) => ({
+        id: j._id, status: "cancelled", backendStatus: "cancelled",
+        title: j.title, hirerName: j.hirer?.fullName || null,
+        price: j.price, category: j.category, scheduledAt: j.scheduledAt,
+      })));
   }
 
-  const statusMap = { "in-progress": ["assigned", "in_progress", "awaiting_confirmation"], completed: ["completed"], cancelled: ["cancelled"] };
+  const statusMap = {
+    "in-progress": ["assigned", "in_progress", "awaiting_confirmation"],
+    completed: ["completed"],
+  };
   const jobStatuses = statusMap[status];
   if (!jobStatuses) return res.status(400).json({ message: "status ไม่ถูกต้อง" });
 
@@ -342,7 +384,7 @@ const getMyWorkerJobs = asyncHandler(async (req, res) => {
     .populate("hirer", "fullName avatarUrl")
     .sort({ updatedAt: -1 });
 
-  const result = jobs.map((j) => ({
+  res.json(jobs.map((j) => ({
     id: j._id,
     status,
     backendStatus: j.status,
@@ -350,8 +392,8 @@ const getMyWorkerJobs = asyncHandler(async (req, res) => {
     hirerName: j.hirer?.fullName || null,
     price: j.price,
     category: j.category,
-  }));
-  res.json(result);
+    scheduledAt: j.scheduledAt,
+  })));
 });
 
 /* ---------- Completion proof + durable Hirer confirmation (PR 1) ---------- */
@@ -531,6 +573,6 @@ const confirmCompletion = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
-  createJob, getMyJobs, getJobById, cancelJob,
+  createJob, getMyJobs, getJobById, getJobTimeline, cancelJob,
   getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion, getCompletionProof,
 };
