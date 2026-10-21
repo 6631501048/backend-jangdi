@@ -44,7 +44,8 @@ const jobSchema = new mongoose.Schema(
         "rejected", // ไม่ผ่านตัวกรอง/Admin ปฏิเสธ
         "waiting", // ประกาศแล้ว รอผู้สมัคร/ยังไม่เลือก Worker (JOB_WAITING)
         "assigned", // เลือก Worker แล้ว รอเริ่มงาน
-        "in_progress", // Worker กำลังทำงาน (on_the_way / arrived ฯลฯ เก็บใน subStatus)
+        "in_progress", // Worker is doing the job
+        "awaiting_confirmation", // Worker submitted proof; waiting for Hirer confirmation
         "completed", // Hirer ยืนยันงานเสร็จแล้ว
         "cancelled",
         "disputed",

@@ -95,7 +95,8 @@ const createJob = asyncHandler(async (req, res) => {
 const getMyJobs = asyncHandler(async (req, res) => {
   const { status } = req.query;
   const query = { hirer: req.user._id };
-  if (status) query.status = status;
+  if (status === "assigned") query.status = { $in: ["assigned", "in_progress", "awaiting_confirmation"] };
+  else if (status) query.status = status;
 
   const jobs = await Job.find(query).sort({ createdAt: -1 });
   res.json(jobs);
@@ -331,7 +332,7 @@ const getMyWorkerJobs = asyncHandler(async (req, res) => {
     return res.json(result);
   }
 
-  const statusMap = { "in-progress": ["assigned", "in_progress"], completed: ["completed"], cancelled: ["cancelled"] };
+  const statusMap = { "in-progress": ["assigned", "in_progress", "awaiting_confirmation"], completed: ["completed"], cancelled: ["cancelled"] };
   const jobStatuses = statusMap[status];
   if (!jobStatuses) return res.status(400).json({ message: "status ไม่ถูกต้อง" });
 
@@ -375,12 +376,12 @@ const updateJobStatus = [
       return res.status(403).json({ message: "คุณไม่ใช่ผู้รับจ้างของงานนี้" });
     }
 
-    const allowedTransitions = { assigned: "in_progress", in_progress: "completed" };
+    const allowedTransitions = { assigned: "in_progress", in_progress: "awaiting_confirmation" };
     if (allowedTransitions[job.status] !== next) {
       return res.status(400).json({ message: `ไม่สามารถเปลี่ยนจาก ${job.status} ไปเป็น ${next} ได้` });
     }
 
-    if (next === "completed") {
+    if (next === "awaiting_confirmation") {
       if (!req.file) return res.status(400).json({ message: "ต้องแนบรูปภาพหลักฐานก่อนทำเครื่องหมายว่างานเสร็จ" }); // FR-TRACK-03
       job.completionProofUrl = `/uploads/job-proofs/${req.file.filename}`;
     }
@@ -396,7 +397,7 @@ const updateJobStatus = [
       userId: job.hirer,
       type: "job_status_change",
       title: "งานมีการอัปเดตสถานะ",
-      message: `${job.title} — ${next === "completed" ? "เสร็จสิ้นแล้ว รอคุณยืนยัน" : "เริ่มดำเนินการแล้ว"}`,
+      message: `${job.title} - ${next === "awaiting_confirmation" ? "Proof uploaded; waiting for your confirmation." : "Work started."}`,
       relatedEntityType: "Job",
       relatedEntityId: job._id,
     }); // FR-TRACK-02
@@ -415,7 +416,7 @@ const confirmCompletion = asyncHandler(async (req, res) => {
   if (String(job.hirer) !== String(req.user._id)) {
     return res.status(403).json({ message: "คุณไม่ใช่เจ้าของงานนี้" });
   }
-  if (job.status !== "completed") {
+  if (job.status !== "awaiting_confirmation") {
     return res.status(400).json({ message: "งานนี้ยังไม่ถูกทำเครื่องหมายว่าเสร็จโดยผู้รับจ้าง" });
   }
 
@@ -434,6 +435,20 @@ const confirmCompletion = asyncHandler(async (req, res) => {
       relatedEntityId: payment._id,
     });
   }
+
+  const previousStatus = job.status;
+  job.status = "completed";
+  await job.save();
+  await logJobStatusChange({ jobId: job._id, previousStatus, newStatus: "completed", changedBy: req.user._id });
+
+  await notifyUser(req.app.get("io"), {
+    userId: job.selectedWorker,
+    type: "job_status_change",
+    title: "Job completed",
+    message: `${job.title} - the hirer confirmed completion.`,
+    relatedEntityType: "Job",
+    relatedEntityId: job._id,
+  });
 
   res.json({ message: "ยืนยันงานเสร็จสำเร็จ", job, payment });
 });
