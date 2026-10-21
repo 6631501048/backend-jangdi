@@ -7,7 +7,8 @@ const { detectProofImage } = require("../utils/proofImage");
 const { Job, JobWaiting, Payment, JobLog } = require("../models");
 const { checkContent } = require("../utils/contentFilter");
 const { logJobStatusChange } = require("../services/jobLog.service");
-const { notifyUser } = require("../services/notification.service");
+const { createNotification, deliverNotification, notifyUser } = require("../services/notification.service");
+const { withTransaction } = require("../services/transaction.service");
 
 /**
  * POST /api/jobs
@@ -397,7 +398,7 @@ const getMyWorkerJobs = asyncHandler(async (req, res) => {
 });
 
 /* ---------- Completion proof + durable Hirer confirmation (PR 1) ---------- */
-const PROOF_DIR = path.join(__dirname, "..", "..", "uploads", "job-proofs");
+const PROOF_DIR = path.resolve(process.env.JOB_PROOF_DIR || path.join(__dirname, "..", "..", "uploads", "job-proofs"));
 fs.mkdirSync(PROOF_DIR, { recursive: true });
 
 // Keep an untrusted upload in memory until ownership, state and the image signature
@@ -426,25 +427,25 @@ const updateJobStatus = [
   asyncHandler(async (req, res) => {
     const { next } = req.body;
     const job = await Job.findById(req.params.id);
-    if (!job) return res.status(404).json({ message: "ไม่พบงานนี้" });
+    if (!job) return res.status(404).json({ message: "Job not found." });
     if (String(job.selectedWorker) !== String(req.user._id)) {
-      return res.status(403).json({ message: "คุณไม่ใช่ผู้รับจ้างของงานนี้" });
+      return res.status(403).json({ message: "You are not the selected Worker for this job." });
     }
     const allowedTransitions = { assigned: "in_progress", in_progress: "awaiting_confirmation" };
     if (allowedTransitions[job.status] !== next) {
-      return res.status(409).json({ message: `ไม่สามารถเปลี่ยนจาก ${job.status} ไปเป็น ${next} ได้` });
+      return res.status(409).json({ message: `Cannot change status from ${job.status} to ${next}.` });
     }
     if (next === "in_progress" && req.file) {
-      return res.status(400).json({ message: "ยังไม่ต้องแนบรูปก่อนเริ่มทำงาน" });
+      return res.status(400).json({ message: "Do not attach a photo before starting the job." });
     }
 
     const fields = { status: next };
     let savedImagePath = null;
     if (next === "awaiting_confirmation") {
-      if (!req.file) return res.status(400).json({ message: "กรุณาแนบภาพหลักฐานก่อนส่งงาน" });
+      if (!req.file) return res.status(400).json({ message: "Attach a completion photo before submitting the job." });
       const kind = detectProofImage(req.file.buffer);
       if (!kind || kind.mime !== req.file.mimetype) {
-        return res.status(400).json({ message: "ชนิดไฟล์ภาพไม่ถูกต้อง (รองรับ JPG, PNG, WebP เท่านั้น)" });
+        return res.status(400).json({ message: "The image content does not match a supported JPG, PNG, or WebP file." });
       }
       const filename = `${job._id}-${randomUUID()}${kind.ext}`;
       savedImagePath = path.join(PROOF_DIR, filename);
@@ -454,33 +455,47 @@ const updateJobStatus = [
     }
 
     let updated;
+    let notification;
     try {
-      // Atomic compare-and-set: concurrent submissions cannot overwrite the evidence.
-      updated = await Job.findOneAndUpdate(
-        { _id: job._id, selectedWorker: req.user._id, status: job.status },
-        { $set: fields },
-        { new: true, runValidators: true }
-      );
+      await withTransaction(async (session) => {
+        updated = await Job.findOneAndUpdate(
+          { _id: job._id, selectedWorker: req.user._id, status: job.status },
+          { $set: fields },
+          { new: true, runValidators: true, session }
+        );
+        if (!updated) {
+          const conflict = new Error("Job status changed before the update completed.");
+          conflict.code = "JOB_STATUS_CONFLICT";
+          throw conflict;
+        }
+        await logJobStatusChange({
+          jobId: updated._id, previousStatus: job.status, newStatus: next, changedBy: req.user._id, session,
+        });
+        notification = await createNotification({
+          userId: updated.hirer,
+          type: "job_status_change",
+          title: next === "awaiting_confirmation" ? "Completion proof submitted" : "Worker started the job",
+          message: next === "awaiting_confirmation"
+            ? `Worker submitted proof for "${updated.title}". Please review and confirm.`
+            : updated.title,
+          relatedEntityType: "Job",
+          relatedEntityId: updated._id,
+        }, session);
+      });
     } catch (err) {
       if (savedImagePath) await fs.promises.unlink(savedImagePath).catch(() => {});
+      if (err.code === "JOB_STATUS_CONFLICT") {
+        return res.status(409).json({ message: "Job status changed. Refresh and try again." });
+      }
       throw err;
     }
-    if (!updated) {
-      if (savedImagePath) await fs.promises.unlink(savedImagePath).catch(() => {});
-      return res.status(409).json({ message: "สถานะงานเปลี่ยนไปแล้ว กรุณาโหลดหน้าใหม่" });
-    }
 
-    await logJobStatusChange({ jobId: updated._id, previousStatus: job.status, newStatus: next, changedBy: req.user._id });
-    await notifyUser(req.app.get("io"), {
-      userId: updated.hirer,
-      type: "job_status_change",
-      title: next === "awaiting_confirmation" ? "มีงานรอตรวจสอบหลักฐาน" : "Worker เริ่มทำงานแล้ว",
-      message: next === "awaiting_confirmation" ? `Worker ส่งหลักฐานงาน "${updated.title}" แล้ว กรุณาตรวจสอบและยืนยัน` : updated.title,
-      relatedEntityType: "Job",
-      relatedEntityId: updated._id,
+    await deliverNotification(req.app.get("io"), notification);
+
+    res.json({
+      message: next === "awaiting_confirmation" ? "Proof submitted; waiting for Hirer confirmation." : "Job started.",
+      job: updated,
     });
-
-    res.json({ message: next === "awaiting_confirmation" ? "ส่งหลักฐานแล้ว รอ Hirer ยืนยัน" : "เริ่มงานสำเร็จ", job: updated });
   }),
 ];
 
@@ -515,61 +530,117 @@ const getCompletionProof = asyncHandler(async (req, res) => {
 /** POST /api/jobs/:id/confirm-completion — Hirer is the ONLY person who can close a job. */
 const confirmCompletion = asyncHandler(async (req, res) => {
   const job = await Job.findById(req.params.id);
-  if (!job) return res.status(404).json({ message: "ไม่พบงานนี้" });
+  if (!job) return res.status(404).json({ message: "Job not found." });
   if (String(job.hirer) !== String(req.user._id)) {
-    return res.status(403).json({ message: "คุณไม่ใช่เจ้าของงานนี้" });
+    return res.status(403).json({ message: "You are not the Hirer who owns this job." });
   }
   if (job.status === "completed" || job.completionConfirmedAt) {
-    return res.status(409).json({ message: "งานนี้ได้รับการยืนยันแล้ว" });
+    return res.status(409).json({ message: "This job has already been confirmed." });
   }
   if (job.status !== "awaiting_confirmation") {
-    return res.status(409).json({ message: "ยังไม่มีงานที่รอให้คุณยืนยัน" });
+    return res.status(409).json({ message: "This job is not waiting for confirmation." });
   }
   if (!job.completionProofUrl) {
-    return res.status(400).json({ message: "ยังไม่มีรูปหลักฐาน ไม่สามารถยืนยันงานได้" });
+    return res.status(400).json({ message: "No completion photo is attached to this job." });
+  }
+
+  const proofMatch = /^\/uploads\/job-proofs\/([a-zA-Z0-9_.-]+)$/.exec(job.completionProofUrl);
+  if (!proofMatch || proofMatch[1] === "." || proofMatch[1] === "..") {
+    return res.status(400).json({ message: "Completion proof path is invalid. Ask the Worker to submit the photo again." });
+  }
+  let proofBytes;
+  try {
+    proofBytes = await fs.promises.readFile(path.join(PROOF_DIR, proofMatch[1]));
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return res.status(409).json({ message: "Completion photo is missing from storage. Ask the Worker to submit the photo again." });
+    }
+    throw err;
+  }
+  if (!detectProofImage(proofBytes)) {
+    return res.status(409).json({ message: "Completion photo cannot be read as a supported image. Ask the Worker to submit the photo again." });
   }
 
   const confirmedAt = new Date();
-  // One winner, even when two requests arrive simultaneously or after a refresh.
-  const updated = await Job.findOneAndUpdate(
-    {
-      _id: job._id, hirer: req.user._id, status: "awaiting_confirmation",
-      completionConfirmedAt: null, completionProofUrl: { $type: "string", $ne: "" },
-    },
-    { $set: { status: "completed", completionConfirmedAt: confirmedAt, completionConfirmedBy: req.user._id } },
-    { new: true, runValidators: true }
-  );
-  if (!updated) return res.status(409).json({ message: "งานนี้ถูกยืนยันหรือเปลี่ยนสถานะไปแล้ว" });
+  let updated;
+  let payment;
+  let notifications = [];
+  try {
+    await withTransaction(async (session) => {
+      notifications = [];
+      updated = await Job.findOneAndUpdate(
+        {
+          _id: job._id,
+          hirer: req.user._id,
+          status: "awaiting_confirmation",
+          completionConfirmedAt: null,
+          completionProofUrl: job.completionProofUrl,
+        },
+        { $set: { status: "completed", completionConfirmedAt: confirmedAt, completionConfirmedBy: req.user._id } },
+        { new: true, runValidators: true, session }
+      );
+      if (!updated) {
+        const conflict = new Error("Job was already confirmed or changed.");
+        conflict.code = "JOB_CONFIRMATION_CONFLICT";
+        throw conflict;
+      }
 
-  await logJobStatusChange({ jobId: updated._id, previousStatus: "awaiting_confirmation", newStatus: "completed", changedBy: req.user._id });
+      payment = await Payment.findOneAndUpdate(
+        { job: updated._id, hirer: updated.hirer, worker: updated.selectedWorker, status: "held" },
+        { $set: { status: "released", releasedAt: confirmedAt } },
+        { new: true, runValidators: true, session }
+      );
+      if (!payment) {
+        const missingPayment = new Error("The demo payment is not in held state.");
+        missingPayment.code = "PAYMENT_NOT_HELD";
+        throw missingPayment;
+      }
 
-  // PR 1 retains the pre-existing DEMO payment workflow; NO real transfer occurs.
-  // Guard the update so it cannot release the simulation twice.
-  const payment = await Payment.findOneAndUpdate(
-    { job: updated._id, status: "held" },
-    { $set: { status: "released", releasedAt: confirmedAt } },
-    { new: true, runValidators: true }
-  );
-  if (payment) {
-    await notifyUser(req.app.get("io"), {
-      userId: updated.selectedWorker,
-      type: "payment_update",
-      title: "บันทึกการจ่ายเงินจำลองแล้ว",
-      message: `ระบบได้บันทึกสถานะจ่ายเงินจำลองสำหรับงาน "${updated.title}" (ยังไม่มีการโอนเงินจริง)`,
-      relatedEntityType: "Payment",
-      relatedEntityId: payment._id,
+      await logJobStatusChange({
+        jobId: updated._id,
+        previousStatus: "awaiting_confirmation",
+        newStatus: "completed",
+        changedBy: req.user._id,
+        session,
+      });
+
+      // Store delivery intents with the state change. Socket delivery runs after commit
+      // and pending records are retried independently without confirming the job again.
+      notifications.push(await createNotification({
+        userId: updated.selectedWorker,
+        type: "payment_update",
+        title: "Demo payment recorded",
+        message: `The demo payment for "${updated.title}" is recorded as released. No real transfer occurred.`,
+        relatedEntityType: "Payment",
+        relatedEntityId: payment._id,
+      }, session));
+      notifications.push(await createNotification({
+        userId: updated.selectedWorker,
+        type: "job_status_change",
+        title: "Job confirmed as completed",
+        message: `The Hirer confirmed "${updated.title}" as completed.`,
+        relatedEntityType: "Job",
+        relatedEntityId: updated._id,
+      }, session));
     });
+  } catch (err) {
+    if (err.code === "JOB_CONFIRMATION_CONFLICT") {
+      return res.status(409).json({ message: "This job was confirmed or changed by another request." });
+    }
+    if (err.code === "PAYMENT_NOT_HELD") {
+      return res.status(409).json({ message: "The job payment is not held. The job was not changed." });
+    }
+    throw err;
   }
-  await notifyUser(req.app.get("io"), {
-    userId: updated.selectedWorker,
-    type: "job_status_change",
-    title: "งานได้รับการยืนยันแล้ว",
-    message: `Hirer ยืนยันงาน "${updated.title}" สำเร็จ`,
-    relatedEntityType: "Job",
-    relatedEntityId: updated._id,
-  });
 
-  res.json({ message: "ยืนยันเสร็จงานสำเร็จ (การจ่ายเงินเป็นระบบจำลอง)", job: updated, payment });
+  const io = req.app.get("io");
+  await Promise.all(notifications.map((notification) => deliverNotification(io, notification)));
+
+  res.json({
+    message: "Job confirmed. The payment record is in DEMO mode; no real transfer occurred.",
+    job: updated,
+    payment,
+  });
 });
 
 module.exports = {

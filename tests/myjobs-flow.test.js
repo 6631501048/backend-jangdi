@@ -69,6 +69,19 @@ test("cancelled applications are moved from Waiting to Cancelled tab", async () 
   const removed = await invoke(ctrl.getMyWorkerJobs, { user: { _id: "w1" }, query: { status: "cancelled" } });
   assert.deepEqual(removed.body.map((j) => j.id), ["j3"]);
 });
+test("Hirer active My Jobs tab groups awaiting confirmation with active work", async () => {
+  reset();
+  store.selectedJobs = [
+    { _id: "assigned", status: "assigned", hirer: "h1" },
+    { _id: "progress", status: "in_progress", hirer: "h1" },
+    { _id: "proof", status: "awaiting_confirmation", hirer: "h1" },
+    { _id: "done", status: "completed", hirer: "h1" },
+  ];
+  const active = await invoke(ctrl.getMyJobs, { query: { status: "assigned" } });
+  assert.deepEqual(active.body.map((job) => job._id), ["assigned", "progress", "proof"]);
+  const completed = await invoke(ctrl.getMyJobs, { query: { status: "completed" } });
+  assert.deepEqual(completed.body.map((job) => job._id), ["done"]);
+});
 test("timeline only exposes status timestamps to the job parties", async () => {
   reset(); store.job.selectedWorker = "w1";
   store.logs = [{ newStatus: "assigned", createdAt: new Date("2026-10-22T01:00:00Z") }];

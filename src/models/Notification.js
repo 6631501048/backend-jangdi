@@ -29,10 +29,15 @@ const notificationSchema = new mongoose.Schema(
 
     isRead: { type: Boolean, default: false }, // FR-NOTIF-03
     sentViaEmail: { type: Boolean, default: false }, // FR-NOTIF-02
+    deliveryStatus: { type: String, enum: ["pending", "delivered"], default: "pending" },
+    deliveryAttempts: { type: Number, default: 0, min: 0 },
+    lastDeliveryError: { type: String, default: null },
+    deliveredAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
 
 notificationSchema.index({ user: 1, isRead: 1, createdAt: -1 });
+notificationSchema.index({ deliveryStatus: 1, createdAt: 1 });
 
 module.exports = mongoose.model("Notification", notificationSchema);

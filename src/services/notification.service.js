@@ -1,59 +1,82 @@
 const { Notification, User } = require("../models");
 const { sendEmail } = require("../utils/mailer");
 
-/**
- * ประเภทการแจ้งเตือนที่ต้องส่งอีเมลเป็น "ช่องทางหลัก" ตาม FR-NOTIF-01
- * (Objective 1.2.2 ของ proposal ระบุอีเมลเป็นกลไกหลักสำหรับแจ้งงานใหม่ใกล้เคียง)
- */
 const EMAIL_PRIMARY_TYPES = ["new_nearby_job"];
 
-/**
- * สร้าง Notification ในฐานข้อมูล + ส่งแบบเรียลไทม์ผ่าน Socket.IO (FR-NOTIF-02, ช่องทางเสริม)
- * + ส่งอีเมลจริงเป็นช่องทางหลักสำหรับ type ที่อยู่ใน EMAIL_PRIMARY_TYPES (FR-NOTIF-01)
- *
- * @param {import("socket.io").Server} io
- * @param {object} params
- * @param {boolean} [params.forceEmail] บังคับส่งอีเมลแม้ type จะไม่อยู่ใน EMAIL_PRIMARY_TYPES (เช่น ใช้กับการยืนยันบัญชี)
- */
-async function notifyUser(io, { userId, type, title, message, relatedEntityType, relatedEntityId, forceEmail }) {
-  const notif = await Notification.create({
+async function createNotification({ userId, type, title, message, relatedEntityType, relatedEntityId }, session) {
+  const data = {
     user: userId,
     type,
     title,
     message,
     relatedEntityType: relatedEntityType || null,
     relatedEntityId: relatedEntityId || null,
-  });
-
-  // FR-NOTIF-02: ช่องทางเสริมแบบเรียลไทม์สำหรับผู้ใช้ที่ออนไลน์อยู่
-  if (io) {
-    io.to(`user:${userId}`).emit("notification", {
-      _id: notif._id,
-      type: notif.type,
-      title: notif.title,
-      message: notif.message,
-      isRead: notif.isRead,
-      createdAt: notif.createdAt,
-    });
+    deliveryStatus: "pending",
+  };
+  if (session) {
+    const [created] = await Notification.create([data], { session });
+    return created;
   }
-
-  // FR-NOTIF-01: อีเมลเป็นช่องทางหลัก สำหรับแจ้งงานใหม่ใกล้เคียง (ตาม Objective 1.2.2)
-  if (forceEmail || EMAIL_PRIMARY_TYPES.includes(type)) {
-    const user = await User.findById(userId).select("email");
-    if (user?.email) {
-      const result = await sendEmail({
-        to: user.email,
-        subject: title,
-        html: `<p>${message}</p>`,
-      });
-      if (result.sent) {
-        notif.sentViaEmail = true;
-        await notif.save();
-      }
-    }
-  }
-
-  return notif;
+  return Notification.create(data);
 }
 
-module.exports = { notifyUser };
+async function deliverNotification(io, notification) {
+  if (!notification || !io) return false;
+  try {
+    const room = `user:${notification.user}`;
+    const sockets = await io.in(room).fetchSockets();
+    if (sockets.length === 0) throw new Error("recipient is offline; delivery remains pending");
+    io.to(room).emit("notification", {
+      _id: notification._id,
+      type: notification.type,
+      title: notification.title,
+      message: notification.message,
+      isRead: notification.isRead,
+      createdAt: notification.createdAt,
+    });
+    await Notification.updateOne(
+      { _id: notification._id, deliveryStatus: "pending" },
+      { $set: { deliveryStatus: "delivered", deliveredAt: new Date(), lastDeliveryError: null }, $inc: { deliveryAttempts: 1 } }
+    );
+    return true;
+  } catch (err) {
+    await Notification.updateOne(
+      { _id: notification._id },
+      { $set: { deliveryStatus: "pending", lastDeliveryError: String(err.message || err).slice(0, 500) }, $inc: { deliveryAttempts: 1 } }
+    ).catch(() => {});
+    console.error(`Notification delivery failed (${notification._id}): ${err.message || err}`);
+    return false;
+  }
+}
+
+async function retryPendingNotifications(io, limit = 100) {
+  if (!io) return 0;
+  const pending = await Notification.find({ deliveryStatus: "pending" }).sort({ createdAt: 1 }).limit(limit).lean();
+  let delivered = 0;
+  for (const notification of pending) {
+    if (await deliverNotification(io, notification)) delivered += 1;
+  }
+  return delivered;
+}
+
+async function notifyUser(io, params) {
+  const notification = await createNotification(params);
+  await deliverNotification(io, notification);
+
+  if (params.forceEmail || EMAIL_PRIMARY_TYPES.includes(params.type)) {
+    try {
+      const user = await User.findById(params.userId).select("email");
+      if (user?.email) {
+        const result = await sendEmail({ to: user.email, subject: params.title, html: `<p>${params.message}</p>` });
+        if (result.sent) {
+          await Notification.updateOne({ _id: notification._id }, { $set: { sentViaEmail: true } });
+        }
+      }
+    } catch (err) {
+      console.error(`Notification email failed (${notification._id}): ${err.message || err}`);
+    }
+  }
+  return notification;
+}
+
+module.exports = { createNotification, deliverNotification, notifyUser, retryPendingNotifications };

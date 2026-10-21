@@ -19,7 +19,8 @@ test("image signatures allow only jpeg, png and webp", () => {
 
 // Controller-only checks with a deterministic in-memory model mock. No MongoDB
 // connection is used; this does NOT replace end-to-end testing against Atlas.
-const store = { job: null, payment: null, logs: [], notifications: [], casUpdates: 0 };
+const store = { job: null, payment: null, logs: [], notifications: [], delivered: [], casUpdates: 0, failLog: false, failDelivery: false };
+let transactionQueue = Promise.resolve();
 const models = {
   Job: {
     findById: async (id) => store.job && String(store.job._id) === String(id) ? { ...store.job } : null,
@@ -28,7 +29,7 @@ const models = {
       if (query.hirer && String(query.hirer) !== String(store.job.hirer)) return null;
       if (query.selectedWorker && String(query.selectedWorker) !== String(store.job.selectedWorker)) return null;
       if (query.completionConfirmedAt === null && store.job.completionConfirmedAt != null) return null;
-      if (query.completionProofUrl && !store.job.completionProofUrl) return null;
+      if (query.completionProofUrl && String(query.completionProofUrl) !== String(store.job.completionProofUrl)) return null;
       store.casUpdates++;
       Object.assign(store.job, update.$set);
       return { ...store.job };
@@ -36,7 +37,8 @@ const models = {
   },
   Payment: {
     findOneAndUpdate: async (query, update) => {
-      if (!store.payment || store.payment.job !== query.job || store.payment.status !== query.status) return null;
+      if (!store.payment || String(store.payment.job) !== String(query.job) || String(store.payment.hirer) !== String(query.hirer) ||
+          String(store.payment.worker) !== String(query.worker) || store.payment.status !== query.status) return null;
       Object.assign(store.payment, update.$set);
       return { ...store.payment };
     },
@@ -48,19 +50,57 @@ function stub(rel, exportsValue) {
   require.cache[filename] = { id: filename, filename, loaded: true, exports: exportsValue };
 }
 stub("../src/models", models);
-stub("../src/services/jobLog.service", { logJobStatusChange: async (log) => { store.logs.push(log); } });
-stub("../src/services/notification.service", { notifyUser: async (_, item) => { store.notifications.push(item); } });
+stub("../src/services/jobLog.service", { logJobStatusChange: async (log) => {
+  if (store.failLog) throw new Error("simulated log write failure");
+  store.logs.push(log);
+} });
+stub("../src/services/notification.service", {
+  createNotification: async (item) => {
+    const notification = { ...item, _id: `notification-${store.notifications.length + 1}` };
+    store.notifications.push(notification);
+    return notification;
+  },
+  deliverNotification: async (_, notification) => { if (!store.failDelivery) store.delivered.push(notification._id); return !store.failDelivery; },
+  notifyUser: async (_, item) => { store.notifications.push(item); },
+});
+stub("../src/services/transaction.service", {
+  withTransaction: (work) => {
+    const operation = transactionQueue.then(async () => {
+      const snapshot = {
+        job: { ...store.job }, payment: store.payment && { ...store.payment },
+        logs: [...store.logs], notifications: [...store.notifications], casUpdates: store.casUpdates,
+      };
+      try { return await work({ mocked: true }); }
+      catch (err) {
+        store.job = snapshot.job;
+        store.payment = snapshot.payment;
+        store.logs = snapshot.logs;
+        store.notifications = snapshot.notifications;
+        store.casUpdates = snapshot.casUpdates;
+        throw err;
+      }
+    });
+    transactionQueue = operation.catch(() => {});
+    return operation;
+  },
+});
+const proofPath = path.join(__dirname, "..", "uploads", "job-proofs", "pr1-confirm-picture.jpg");
 const controller = require("../src/controllers/job.controller");
 const secondMiddleware = controller.updateJobStatus[1];
 
 function seed(status = "awaiting_confirmation", hasProof = true) {
   store.job = { _id: "job-1", hirer: "hirer-1", selectedWorker: "worker-1", title: "Carry parcel", status,
-    completionProofUrl: hasProof ? "/uploads/job-proofs/fixture.jpg" : null,
+    completionProofUrl: hasProof ? "/uploads/job-proofs/pr1-confirm-picture.jpg" : null,
     completionConfirmedAt: null, completionConfirmedBy: null };
-  store.payment = { _id: "pay-1", job: "job-1", status: "held" };
+  fs.mkdirSync(path.dirname(proofPath), { recursive: true });
+  fs.writeFileSync(proofPath, jpeg);
+  store.payment = { _id: "pay-1", job: "job-1", hirer: "hirer-1", worker: "worker-1", status: "held" };
   store.casUpdates = 0;
   store.logs = [];
   store.notifications = [];
+  store.delivered = [];
+  store.failLog = false;
+  store.failDelivery = false;
 }
 function reqFor(userId = "hirer-1", body = {}) {
   return { params: { id: "job-1" }, body, user: { _id: userId, isAdmin: false }, app: { get: () => null } };
@@ -88,14 +128,15 @@ test("Hirer confirmation persists identity/time, transitions once, and releases 
   assert.equal(store.payment.status, "released");
   assert.equal(store.logs.length, 1);
   assert.equal(store.casUpdates, 1);
-  assert.match(JSON.stringify(store.notifications), /จำลอง/);
-  assert.doesNotMatch(JSON.stringify(store.notifications), /ถูกโอนเข้าบัญชีของคุณแล้ว/);
+  assert.match(JSON.stringify(store.notifications), /No real transfer occurred/);
+  assert.doesNotMatch(JSON.stringify(store.notifications), /real transfer happened/i);
 
   const again = await call(controller.confirmCompletion, reqFor());
   assert.equal(again.statusCode, 409);
   assert.equal(store.casUpdates, 1);
   assert.equal(store.logs.length, 1);
   assert.equal(store.notifications.length, 2);
+  assert.equal(store.delivered.length, 2);
 });
 
 test("a non-owner may not confirm", async () => {
@@ -124,12 +165,71 @@ test("lost compare-and-set race returns conflict instead of duplicate completion
   } finally { models.Job.findOneAndUpdate = orig; }
 });
 
+test("missing or invalid proof blocks confirmation without changing records", async () => {
+  seed();
+  fs.unlinkSync(proofPath);
+  const missing = await call(controller.confirmCompletion, reqFor());
+  assert.equal(missing.statusCode, 409);
+  assert.equal(store.job.status, "awaiting_confirmation");
+  assert.equal(store.payment.status, "held");
+  assert.equal(store.logs.length, 0);
+
+  seed();
+  fs.writeFileSync(proofPath, Buffer.from("not an image"));
+  const invalid = await call(controller.confirmCompletion, reqFor());
+  assert.equal(invalid.statusCode, 409);
+  assert.equal(store.job.status, "awaiting_confirmation");
+  fs.writeFileSync(proofPath, jpeg);
+});
+
+test("payment or audit-log failure rolls back Job and prevents notifications", async () => {
+  seed();
+  store.payment = null;
+  const paymentFailure = await call(controller.confirmCompletion, reqFor());
+  assert.equal(paymentFailure.statusCode, 409);
+  assert.equal(store.job.status, "awaiting_confirmation");
+  assert.equal(store.logs.length, 0);
+  assert.equal(store.notifications.length, 0);
+
+  seed();
+  store.failLog = true;
+  await assert.rejects(() => call(controller.confirmCompletion, reqFor()), /simulated log write failure/);
+  assert.equal(store.job.status, "awaiting_confirmation");
+  assert.equal(store.payment.status, "held");
+  assert.equal(store.notifications.length, 0);
+});
+
+test("simultaneous confirmation requests only commit once", async () => {
+  seed();
+  const results = await Promise.all([
+    call(controller.confirmCompletion, reqFor()),
+    call(controller.confirmCompletion, reqFor()),
+  ]);
+  assert.deepEqual(results.map((result) => result.statusCode).sort(), [200, 409]);
+  assert.equal(store.job.status, "completed");
+  assert.equal(store.payment.status, "released");
+  assert.equal(store.logs.length, 1);
+  assert.equal(store.notifications.length, 2);
+});
+
+test("notification delivery failure leaves durable pending records and does not undo confirmation", async () => {
+  seed();
+  store.failDelivery = true;
+  const response = await call(controller.confirmCompletion, reqFor());
+  assert.equal(response.statusCode, 200);
+  assert.equal(store.job.status, "completed");
+  assert.equal(store.payment.status, "released");
+  assert.equal(store.notifications.length, 2);
+  assert.equal(store.delivered.length, 0);
+});
+
 test("Worker proof submission switches to awaiting_confirmation and records the image", async () => {
   seed("in_progress", false);
   const res = await call(secondMiddleware, { ...reqFor("worker-1", { next: "awaiting_confirmation" }), file: { buffer: jpeg, mimetype: "image/jpeg" } });
   assert.equal(res.statusCode, 200);
   assert.equal(store.job.status, "awaiting_confirmation");
   assert.ok(store.job.proofSubmittedAt instanceof Date);
+  assert.equal(store.notifications.length, 1);
   assert.match(store.job.completionProofUrl, /^\/uploads\/job-proofs\/job-1-[\w-]+\.jpg$/);
   const filename = path.basename(store.job.completionProofUrl);
   const file = path.join(__dirname, "..", "uploads", "job-proofs", filename);
@@ -162,3 +262,5 @@ test("Authenticated image fetch refuses outsiders and serves the real image type
     assert.equal((await call(controller.getCompletionProof, reqFor("worker-1"))).statusCode, 200);
   } finally { fs.unlinkSync(filepath); }
 });
+
+test.after(() => { try { fs.unlinkSync(proofPath); } catch {} });
