@@ -44,7 +44,8 @@ const jobSchema = new mongoose.Schema(
         "rejected", // ไม่ผ่านตัวกรอง/Admin ปฏิเสธ
         "waiting", // ประกาศแล้ว รอผู้สมัคร/ยังไม่เลือก Worker (JOB_WAITING)
         "assigned", // เลือก Worker แล้ว รอเริ่มงาน
-        "in_progress", // Worker กำลังทำงาน (on_the_way / arrived ฯลฯ เก็บใน subStatus)
+        "in_progress", // Worker is doing the job
+        "awaiting_confirmation", // Worker submitted proof; waiting for Hirer confirmation
         "completed", // Hirer ยืนยันงานเสร็จแล้ว
         "cancelled",
         "disputed",
@@ -61,6 +62,10 @@ const jobSchema = new mongoose.Schema(
 
     // FR-TRACK-03: หลักฐานรูปภาพเมื่องานเสร็จ
     completionProofUrl: { type: String, default: null },
+    proofSubmittedAt: { type: Date, default: null },
+    // Hirer confirmation is persisted; frontend component state must never be the source of truth.
+    completionConfirmedAt: { type: Date, default: null },
+    completionConfirmedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
 
     // เชื่อมโยงถ้างานนี้ถูกแปลงมาจาก Service Request (FR-SERV-07)
     originServiceRequest: {

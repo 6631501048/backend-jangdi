@@ -1,11 +1,14 @@
-﻿const asyncHandler = require("express-async-handler");
+const asyncHandler = require("express-async-handler");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
-const { Job, JobWaiting, Payment } = require("../models");
+const { randomUUID } = require("crypto");
+const { detectProofImage } = require("../utils/proofImage");
+const { Job, JobWaiting, Payment, JobLog } = require("../models");
 const { checkContent } = require("../utils/contentFilter");
 const { logJobStatusChange } = require("../services/jobLog.service");
-const { notifyUser } = require("../services/notification.service");
+const { createNotification, deliverNotification, notifyUser } = require("../services/notification.service");
+const { withTransaction } = require("../services/transaction.service");
 
 /**
  * POST /api/jobs
@@ -95,10 +98,26 @@ const createJob = asyncHandler(async (req, res) => {
 const getMyJobs = asyncHandler(async (req, res) => {
   const { status } = req.query;
   const query = { hirer: req.user._id };
-  if (status) query.status = status;
+  if (status === "assigned") query.status = { $in: ["assigned", "in_progress", "awaiting_confirmation"] };
+  else if (status) query.status = status;
 
   const jobs = await Job.find(query).sort({ createdAt: -1 });
   res.json(jobs);
+});
+
+/** GET /api/jobs/:id/timeline — real audit timestamps, limited to the job participants. */
+const getJobTimeline = asyncHandler(async (req, res) => {
+  const job = await Job.findById(req.params.id);
+  if (!job) return res.status(404).json({ message: "ไม่พบงานนี้" });
+  const userId = String(req.user._id);
+  if (!req.user.isAdmin && userId !== String(job.hirer) && userId !== String(job.selectedWorker)) {
+    return res.status(403).json({ message: "ไม่มีสิทธิ์ดูประวัติสถานะงานนี้" });
+  }
+  const logs = await JobLog.find({ job: job._id }).sort({ createdAt: 1 });
+  res.json(logs.map((log) => ({
+    status: log.newStatus,
+    at: log.createdAt,
+  })));
 });
 
 /** GET /api/jobs/:id — FR-BROWSE-03 (ดูรายละเอียดงาน) */
@@ -127,28 +146,32 @@ const cancelJob = asyncHandler(async (req, res) => {
       return res.status(400).json({ message: "งานนี้ยังมีผู้สมัคร ไม่สามารถยกเลิกด้วยเหตุหมดเวลาได้" });
     }
   }
-  if (["completed", "cancelled"].includes(job.status)) {
-    return res.status(400).json({ message: `ไม่สามารถยกเลิกงานที่มีสถานะ ${job.status} ได้` });
+  // MVP: allow direct cancellation only before assigning a Worker.
+  // Cancelling an active job with held demo payment requires the later dispute/refund flow.
+  if (!["pending_review", "waiting"].includes(job.status)) {
+    return res.status(409).json({ message: "งานนี้เลือก Worker แล้วหรือปิดงานไปแล้ว กรุณาติดต่อผู้ดูแลเพื่อดำเนินการยกเลิก" });
   }
 
   const previousStatus = job.status;
-  job.status = "cancelled";
-  job.cancelledAt = new Date();
-  job.cancelReason = req.body?.reason || null;
-  await job.save();
+  const cancelled = await Job.findOneAndUpdate(
+    { _id: job._id, hirer: req.user._id, status: previousStatus },
+    { $set: { status: "cancelled", cancelledAt: new Date(), cancelReason: req.body?.reason?.trim() || null } },
+    { new: true, runValidators: true }
+  );
+  if (!cancelled) return res.status(409).json({ message: "สถานะงานเปลี่ยนไปแล้ว กรุณาโหลดหน้าใหม่" });
 
   await logJobStatusChange({
-    jobId: job._id,
+    jobId: cancelled._id,
     previousStatus,
     newStatus: "cancelled",
     changedBy: req.user._id,
-    note: job.cancelReason,
+    note: cancelled.cancelReason,
   });
 
   // TODO (FR-JOB-07 / FR-PAY-06,07): ถ้ามีเงินพักใน Escrow (Payment.status === "held")
   // ให้สร้าง refund request ที่นี่ ต่อเมื่อ implement payment.controller.js
 
-  res.json({ message: "ยกเลิกประกาศงานสำเร็จ", job });
+  res.json({ message: "ยกเลิกประกาศงานสำเร็จ", job: cancelled });
 });
 
 /**
@@ -257,9 +280,13 @@ const selectWorker = asyncHandler(async (req, res) => {
   if (!chosen) return res.status(404).json({ message: "ไม่พบผู้สมัครคนนี้ในคิวของงานนี้" });
 
   const previousStatus = job.status;
-  job.status = "assigned";
-  job.selectedWorker = workerId;
-  await job.save();
+  // Atomic selection so a cancellation or another selection cannot race with this action.
+  const assignedJob = await Job.findOneAndUpdate(
+    { _id: job._id, hirer: req.user._id, status: "waiting" },
+    { $set: { status: "assigned", selectedWorker: workerId } },
+    { new: true, runValidators: true }
+  );
+  if (!assignedJob) return res.status(409).json({ message: "งานนี้ถูกเลือก Worker หรือยกเลิกไปแล้ว กรุณาโหลดหน้าใหม่" });
 
   // FR-MATCH-05: ทำเครื่องหมายผู้สมัครรายอื่นทั้งหมดเป็น "ไม่ได้รับเลือก"
   await JobWaiting.updateMany({ job: job._id, worker: { $ne: workerId } }, { status: "not_selected" });
@@ -302,7 +329,7 @@ const selectWorker = asyncHandler(async (req, res) => {
     relatedEntityId: job._id,
   });
 
-  res.json({ message: "เลือกผู้รับจ้างสำเร็จ", job });
+  res.json({ message: "เลือกผู้รับจ้างสำเร็จ", job: assignedJob });
 });
 
 /**
@@ -312,26 +339,45 @@ const selectWorker = asyncHandler(async (req, res) => {
 const getMyWorkerJobs = asyncHandler(async (req, res) => {
   const { status = "waiting" } = req.query;
 
-  if (status === "waiting") {
-    // ใบสมัครที่ยังรออยู่ในคิว ยังไม่ถูกเลือก (FR-BROWSE-07)
-    const applications = await JobWaiting.find({ worker: req.user._id, status: "waiting" })
-      .populate("job")
+  // Keep the waiting list free of cancelled / closed posts. Cancelled jobs
+  // remain visible in their own tab for Workers who applied before selection.
+  if (status === "waiting" || status === "cancelled") {
+    const applications = await JobWaiting.find({ worker: req.user._id })
+      .populate({ path: "job", populate: { path: "hirer", select: "fullName avatarUrl" } })
       .sort({ createdAt: -1 });
 
-    const result = applications
-      .filter((a) => a.job) // กันกรณีงานถูกลบไปแล้ว
-      .map((a) => ({
-        id: a.job._id,
-        status: "waiting",
-        title: a.job.title,
-        hirerName: null,
-        price: a.job.price,
-        category: a.job.category,
-      }));
-    return res.json(result);
+    if (status === "waiting") {
+      return res.json(applications
+        .filter((a) => a.status === "waiting" && a.job?.status === "waiting")
+        .map((a) => ({
+          id: a.job._id, status: "waiting", backendStatus: "waiting",
+          title: a.job.title, hirerName: a.job.hirer?.fullName || null,
+          price: a.job.price, category: a.job.category, scheduledAt: a.job.scheduledAt,
+        })));
+    }
+
+    // Cancelled after assignment OR after application are both legitimate
+    // cancelled jobs for that Worker. One job appears only once.
+    const cancelledJobs = await Job.find({ selectedWorker: req.user._id, status: "cancelled" })
+      .populate("hirer", "fullName avatarUrl");
+    const byId = new Map();
+    for (const j of cancelledJobs) byId.set(String(j._id), j);
+    for (const a of applications) {
+      if (a.job?.status === "cancelled") byId.set(String(a.job._id), a.job);
+    }
+    return res.json(Array.from(byId.values())
+      .sort((a, b) => new Date(b.cancelledAt || b.updatedAt) - new Date(a.cancelledAt || a.updatedAt))
+      .map((j) => ({
+        id: j._id, status: "cancelled", backendStatus: "cancelled",
+        title: j.title, hirerName: j.hirer?.fullName || null,
+        price: j.price, category: j.category, scheduledAt: j.scheduledAt,
+      })));
   }
 
-  const statusMap = { "in-progress": ["assigned", "in_progress"], completed: ["completed"], cancelled: ["cancelled"] };
+  const statusMap = {
+    "in-progress": ["assigned", "in_progress", "awaiting_confirmation"],
+    completed: ["completed"],
+  };
   const jobStatuses = statusMap[status];
   if (!jobStatuses) return res.status(400).json({ message: "status ไม่ถูกต้อง" });
 
@@ -339,109 +385,265 @@ const getMyWorkerJobs = asyncHandler(async (req, res) => {
     .populate("hirer", "fullName avatarUrl")
     .sort({ updatedAt: -1 });
 
-  const result = jobs.map((j) => ({
+  res.json(jobs.map((j) => ({
     id: j._id,
     status,
+    backendStatus: j.status,
     title: j.title,
     hirerName: j.hirer?.fullName || null,
     price: j.price,
     category: j.category,
-  }));
-  res.json(result);
+    scheduledAt: j.scheduledAt,
+  })));
 });
 
-/* ---------- อัปโหลดรูปหลักฐานงานเสร็จ (FR-TRACK-03) ---------- */
-const PROOF_DIR = path.join(__dirname, "..", "..", "uploads", "job-proofs");
+/* ---------- Completion proof + durable Hirer confirmation (PR 1) ---------- */
+const PROOF_DIR = path.resolve(process.env.JOB_PROOF_DIR || path.join(__dirname, "..", "..", "uploads", "job-proofs"));
 fs.mkdirSync(PROOF_DIR, { recursive: true });
+
+// Keep an untrusted upload in memory until ownership, state and the image signature
+// have been checked. Nothing is written to disk for invalid / unauthorized requests.
 const proofUpload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, PROOF_DIR),
-    filename: (req, file, cb) => cb(null, `${req.params.id}-${Date.now()}${path.extname(file.originalname) || ".jpg"}`),
-  }),
-  limits: { fileSize: 5 * 1024 * 1024 },
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  fileFilter: (req, file, cb) => {
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.mimetype)) {
+      return cb(new Error("รองรับเฉพาะภาพ JPG, PNG หรือ WebP"));
+    }
+    cb(null, true);
+  },
 });
 
-/**
- * PATCH /api/jobs/:id/status — FR-TRACK-01/03/05 (multipart/form-data ถ้าแนบรูป)
- * body: { next: "in_progress" | "completed" }, field รูป: "proof" (บังคับถ้า next=completed)
- */
+const uploadProof = (req, res, next) => proofUpload.single("proof")(req, res, (err) => {
+  if (!err) return next();
+  return res.status(err.code === "LIMIT_FILE_SIZE" ? 413 : 400).json({
+    message: err.code === "LIMIT_FILE_SIZE" ? "ภาพต้องมีขนาดไม่เกิน 5 MB" : err.message,
+  });
+});
+
+/** PATCH /api/jobs/:id/status — assigned -> in_progress -> awaiting_confirmation */
 const updateJobStatus = [
-  proofUpload.single("proof"),
+  uploadProof,
   asyncHandler(async (req, res) => {
     const { next } = req.body;
     const job = await Job.findById(req.params.id);
-    if (!job) return res.status(404).json({ message: "ไม่พบงานนี้" });
+    if (!job) return res.status(404).json({ message: "Job not found." });
     if (String(job.selectedWorker) !== String(req.user._id)) {
-      return res.status(403).json({ message: "คุณไม่ใช่ผู้รับจ้างของงานนี้" });
+      return res.status(403).json({ message: "You are not the selected Worker for this job." });
     }
-
-    const allowedTransitions = { assigned: "in_progress", in_progress: "completed" };
+    const allowedTransitions = { assigned: "in_progress", in_progress: "awaiting_confirmation" };
     if (allowedTransitions[job.status] !== next) {
-      return res.status(400).json({ message: `ไม่สามารถเปลี่ยนจาก ${job.status} ไปเป็น ${next} ได้` });
+      return res.status(409).json({ message: `Cannot change status from ${job.status} to ${next}.` });
+    }
+    if (next === "in_progress" && req.file) {
+      return res.status(400).json({ message: "Do not attach a photo before starting the job." });
     }
 
-    if (next === "completed") {
-      if (!req.file) return res.status(400).json({ message: "ต้องแนบรูปภาพหลักฐานก่อนทำเครื่องหมายว่างานเสร็จ" }); // FR-TRACK-03
-      job.completionProofUrl = `/uploads/job-proofs/${req.file.filename}`;
+    const fields = { status: next };
+    let savedImagePath = null;
+    if (next === "awaiting_confirmation") {
+      if (!req.file) return res.status(400).json({ message: "Attach a completion photo before submitting the job." });
+      const kind = detectProofImage(req.file.buffer);
+      if (!kind || kind.mime !== req.file.mimetype) {
+        return res.status(400).json({ message: "The image content does not match a supported JPG, PNG, or WebP file." });
+      }
+      const filename = `${job._id}-${randomUUID()}${kind.ext}`;
+      savedImagePath = path.join(PROOF_DIR, filename);
+      await fs.promises.writeFile(savedImagePath, req.file.buffer, { flag: "wx" });
+      fields.completionProofUrl = `/uploads/job-proofs/${filename}`;
+      fields.proofSubmittedAt = new Date();
     }
 
-    const previousStatus = job.status;
-    job.status = next;
-    await job.save();
+    let updated;
+    let notification;
+    try {
+      await withTransaction(async (session) => {
+        updated = await Job.findOneAndUpdate(
+          { _id: job._id, selectedWorker: req.user._id, status: job.status },
+          { $set: fields },
+          { new: true, runValidators: true, session }
+        );
+        if (!updated) {
+          const conflict = new Error("Job status changed before the update completed.");
+          conflict.code = "JOB_STATUS_CONFLICT";
+          throw conflict;
+        }
+        await logJobStatusChange({
+          jobId: updated._id, previousStatus: job.status, newStatus: next, changedBy: req.user._id, session,
+        });
+        notification = await createNotification({
+          userId: updated.hirer,
+          type: "job_status_change",
+          title: next === "awaiting_confirmation" ? "Completion proof submitted" : "Worker started the job",
+          message: next === "awaiting_confirmation"
+            ? `Worker submitted proof for "${updated.title}". Please review and confirm.`
+            : updated.title,
+          relatedEntityType: "Job",
+          relatedEntityId: updated._id,
+        }, session);
+      });
+    } catch (err) {
+      if (savedImagePath) await fs.promises.unlink(savedImagePath).catch(() => {});
+      if (err.code === "JOB_STATUS_CONFLICT") {
+        return res.status(409).json({ message: "Job status changed. Refresh and try again." });
+      }
+      throw err;
+    }
 
-    await logJobStatusChange({ jobId: job._id, previousStatus, newStatus: next, changedBy: req.user._id }); // FR-TRACK-05
+    await deliverNotification(req.app.get("io"), notification);
 
-    const io = req.app.get("io");
-    await notifyUser(io, {
-      userId: job.hirer,
-      type: "job_status_change",
-      title: "งานมีการอัปเดตสถานะ",
-      message: `${job.title} — ${next === "completed" ? "เสร็จสิ้นแล้ว รอคุณยืนยัน" : "เริ่มดำเนินการแล้ว"}`,
-      relatedEntityType: "Job",
-      relatedEntityId: job._id,
-    }); // FR-TRACK-02
-
-    res.json({ message: "อัปเดตสถานะสำเร็จ", job });
+    res.json({
+      message: next === "awaiting_confirmation" ? "Proof submitted; waiting for Hirer confirmation." : "Job started.",
+      job: updated,
+    });
   }),
 ];
 
-/**
- * POST /api/jobs/:id/confirm-completion — FR-TRACK-04, FR-PAY-05
- * Hirer ยืนยันงานเสร็จ -> ปล่อยเงิน Escrow ให้ worker (ต้องมีสลิปโอนออกแนบมา — ทำแบบง่ายด้วย outboundSlipUrl ก่อน)
- */
-const confirmCompletion = asyncHandler(async (req, res) => {
+/** GET /api/jobs/:id/completion-proof — only the Hirer, selected Worker or Admin. */
+const getCompletionProof = asyncHandler(async (req, res) => {
   const job = await Job.findById(req.params.id);
   if (!job) return res.status(404).json({ message: "ไม่พบงานนี้" });
+  const userId = String(req.user._id);
+  if (!req.user.isAdmin && userId !== String(job.hirer) && userId !== String(job.selectedWorker)) {
+    return res.status(403).json({ message: "ไม่มีสิทธิ์ดูหลักฐานของงานนี้" });
+  }
+
+  // Resolve only stored paths belonging to our private proof directory. Never accept
+  // filename/path input from the request (prevents path traversal).
+  const match = /^\/uploads\/job-proofs\/([a-zA-Z0-9_.-]+)$/.exec(job.completionProofUrl || "");
+  if (!match || match[1] === "." || match[1] === "..") {
+    return res.status(404).json({ message: "ยังไม่มีหลักฐานของงานนี้" });
+  }
+  let content;
+  try {
+    content = await fs.promises.readFile(path.join(PROOF_DIR, match[1]));
+  } catch (err) {
+    if (err.code === "ENOENT") return res.status(404).json({ message: "ไม่พบไฟล์หลักฐาน" });
+    throw err;
+  }
+  const image = detectProofImage(content);
+  if (!image) return res.status(415).json({ message: "หลักฐานไม่ใช่ไฟล์ภาพที่รองรับ" });
+  res.set({ "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" });
+  res.type(image.mime).send(content);
+});
+
+/** POST /api/jobs/:id/confirm-completion — Hirer is the ONLY person who can close a job. */
+const confirmCompletion = asyncHandler(async (req, res) => {
+  const job = await Job.findById(req.params.id);
+  if (!job) return res.status(404).json({ message: "Job not found." });
   if (String(job.hirer) !== String(req.user._id)) {
-    return res.status(403).json({ message: "คุณไม่ใช่เจ้าของงานนี้" });
+    return res.status(403).json({ message: "You are not the Hirer who owns this job." });
   }
-  if (job.status !== "completed") {
-    return res.status(400).json({ message: "งานนี้ยังไม่ถูกทำเครื่องหมายว่าเสร็จโดยผู้รับจ้าง" });
+  if (job.status === "completed" || job.completionConfirmedAt) {
+    return res.status(409).json({ message: "This job has already been confirmed." });
+  }
+  if (job.status !== "awaiting_confirmation") {
+    return res.status(409).json({ message: "This job is not waiting for confirmation." });
+  }
+  if (!job.completionProofUrl) {
+    return res.status(400).json({ message: "No completion photo is attached to this job." });
   }
 
-  const payment = await Payment.findOne({ job: job._id });
-  if (payment && payment.status === "held") {
-    payment.status = "released";
-    payment.releasedAt = new Date();
-    await payment.save();
+  const proofMatch = /^\/uploads\/job-proofs\/([a-zA-Z0-9_.-]+)$/.exec(job.completionProofUrl);
+  if (!proofMatch || proofMatch[1] === "." || proofMatch[1] === "..") {
+    return res.status(400).json({ message: "Completion proof path is invalid. Ask the Worker to submit the photo again." });
+  }
+  let proofBytes;
+  try {
+    proofBytes = await fs.promises.readFile(path.join(PROOF_DIR, proofMatch[1]));
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return res.status(409).json({ message: "Completion photo is missing from storage. Ask the Worker to submit the photo again." });
+    }
+    throw err;
+  }
+  if (!detectProofImage(proofBytes)) {
+    return res.status(409).json({ message: "Completion photo cannot be read as a supported image. Ask the Worker to submit the photo again." });
+  }
 
-    await notifyUser(req.app.get("io"), {
-      userId: job.selectedWorker,
-      type: "payment_update",
-      title: "ได้รับเงินแล้ว",
-      message: `เงินจากงาน "${job.title}" ถูกโอนเข้าบัญชีของคุณแล้ว`,
-      relatedEntityType: "Payment",
-      relatedEntityId: payment._id,
+  const confirmedAt = new Date();
+  let updated;
+  let payment;
+  let notifications = [];
+  try {
+    await withTransaction(async (session) => {
+      notifications = [];
+      updated = await Job.findOneAndUpdate(
+        {
+          _id: job._id,
+          hirer: req.user._id,
+          status: "awaiting_confirmation",
+          completionConfirmedAt: null,
+          completionProofUrl: job.completionProofUrl,
+        },
+        { $set: { status: "completed", completionConfirmedAt: confirmedAt, completionConfirmedBy: req.user._id } },
+        { new: true, runValidators: true, session }
+      );
+      if (!updated) {
+        const conflict = new Error("Job was already confirmed or changed.");
+        conflict.code = "JOB_CONFIRMATION_CONFLICT";
+        throw conflict;
+      }
+
+      payment = await Payment.findOneAndUpdate(
+        { job: updated._id, hirer: updated.hirer, worker: updated.selectedWorker, status: "held" },
+        { $set: { status: "released", releasedAt: confirmedAt } },
+        { new: true, runValidators: true, session }
+      );
+      if (!payment) {
+        const missingPayment = new Error("The demo payment is not in held state.");
+        missingPayment.code = "PAYMENT_NOT_HELD";
+        throw missingPayment;
+      }
+
+      await logJobStatusChange({
+        jobId: updated._id,
+        previousStatus: "awaiting_confirmation",
+        newStatus: "completed",
+        changedBy: req.user._id,
+        session,
+      });
+
+      // Store delivery intents with the state change. Socket delivery runs after commit
+      // and pending records are retried independently without confirming the job again.
+      notifications.push(await createNotification({
+        userId: updated.selectedWorker,
+        type: "payment_update",
+        title: "Demo payment recorded",
+        message: `The demo payment for "${updated.title}" is recorded as released. No real transfer occurred.`,
+        relatedEntityType: "Payment",
+        relatedEntityId: payment._id,
+      }, session));
+      notifications.push(await createNotification({
+        userId: updated.selectedWorker,
+        type: "job_status_change",
+        title: "Job confirmed as completed",
+        message: `The Hirer confirmed "${updated.title}" as completed.`,
+        relatedEntityType: "Job",
+        relatedEntityId: updated._id,
+      }, session));
     });
+  } catch (err) {
+    if (err.code === "JOB_CONFIRMATION_CONFLICT") {
+      return res.status(409).json({ message: "This job was confirmed or changed by another request." });
+    }
+    if (err.code === "PAYMENT_NOT_HELD") {
+      return res.status(409).json({ message: "The job payment is not held. The job was not changed." });
+    }
+    throw err;
   }
 
-  res.json({ message: "ยืนยันงานเสร็จสำเร็จ", job, payment });
+  const io = req.app.get("io");
+  await Promise.all(notifications.map((notification) => deliverNotification(io, notification)));
+
+  res.json({
+    message: "Job confirmed. The payment record is in DEMO mode; no real transfer occurred.",
+    job: updated,
+    payment,
+  });
 });
 
 module.exports = {
-  createJob, getMyJobs, getJobById, cancelJob,
-  getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion,
+  createJob, getMyJobs, getJobById, getJobTimeline, cancelJob,
+  getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion, getCompletionProof,
 };
-
-
-

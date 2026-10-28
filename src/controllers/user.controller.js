@@ -9,7 +9,7 @@ const { User, Feedback, Job, ServicePost } = require("../models");
  * ตรวจว่า viewer กับ target เป็นคู่งานกันอยู่หรือไม่ (hirer ↔ worker ที่ถูกเลือกของงานเดียวกัน
  * และงานนั้นยังเดินอยู่) — ใช้ตัดสินว่าเปิดเบอร์โทร/LINE ให้เห็นได้ไหม (F11)
  */
-const ACTIVE_JOB_STATUSES = ["assigned", "in_progress", "disputed"];
+const ACTIVE_JOB_STATUSES = ["assigned", "in_progress", "awaiting_confirmation", "disputed"];
 async function isActiveCounterpart(viewerId, targetId) {
   const job = await Job.exists({
     status: { $in: ACTIVE_JOB_STATUSES },
@@ -63,7 +63,7 @@ const getProfile = asyncHandler(async (req, res) => {
  *  - เจ้าของบัญชี / Admin : เห็นทุกสถานะ (รวมรอตรวจสอบ/ถูกปฏิเสธ/ยกเลิก) พร้อมเหตุผลที่ถูกปฏิเสธ และ worker ที่ถูกเลือก
  *  - คนอื่น              : เห็นเฉพาะโพสต์ที่เคยเผยแพร่จริง และไม่เห็นสถานที่/ผู้รับจ้าง
  */
-const PUBLIC_JOB_STATUSES = ["waiting", "assigned", "in_progress", "completed"];
+const PUBLIC_JOB_STATUSES = ["waiting", "assigned", "in_progress", "awaiting_confirmation", "completed"];
 const POST_HISTORY_LIMIT = 50;
 
 const getUserPosts = asyncHandler(async (req, res) => {
