@@ -279,55 +279,68 @@ const selectWorker = asyncHandler(async (req, res) => {
   const chosen = await JobWaiting.findOne({ job: job._id, worker: workerId, status: "waiting" });
   if (!chosen) return res.status(404).json({ message: "ไม่พบผู้สมัครคนนี้ในคิวของงานนี้" });
 
-  const previousStatus = job.status;
-  // Atomic selection so a cancellation or another selection cannot race with this action.
-  const assignedJob = await Job.findOneAndUpdate(
-    { _id: job._id, hirer: req.user._id, status: "waiting" },
-    { $set: { status: "assigned", selectedWorker: workerId } },
-    { new: true, runValidators: true }
-  );
-  if (!assignedJob) return res.status(409).json({ message: "งานนี้ถูกเลือก Worker หรือยกเลิกไปแล้ว กรุณาโหลดหน้าใหม่" });
-
-  // FR-MATCH-05: ทำเครื่องหมายผู้สมัครรายอื่นทั้งหมดเป็น "ไม่ได้รับเลือก"
-  await JobWaiting.updateMany({ job: job._id, worker: { $ne: workerId } }, { status: "not_selected" });
-  chosen.status = "selected";
-  await chosen.save();
-
-  await logJobStatusChange({
-    jobId: job._id,
-    previousStatus,
-    newStatus: "assigned",
-    changedBy: req.user._id,
-    note: `เลือกผู้รับจ้าง ${workerId}`,
-  });
-
-  // FR-PAY-01/02: เปิด Payment record ให้ตรงเข้าสถานะ "held" ทันที
-  // หมายเหตุ: ระบบยังไม่มี endpoint อัปโหลดสลิปเงินเข้า Escrow แยกต่างหาก (FR-PAY-04 ยังเป็น TODO)
-  // จึงถือว่าเงินเข้า Escrow แล้วทันทีที่เลือกผู้รับจ้าง เพื่อให้ flow ฝั่ง worker ทดสอบได้ครบวงจรก่อน
-  const totalAmount = job.price + (job.deliveryFee || 0);
-  const feePercent = Number(process.env.ESCROW_FEE_PERCENT_MIN) || 5;
-  const feeAmount = Math.round((totalAmount * feePercent) / 100);
-  await Payment.create({
-    job: job._id,
-    hirer: job.hirer,
-    worker: workerId,
-    amount: totalAmount,
-    platformFeePercent: feePercent,
-    platformFeeAmount: feeAmount,
-    netAmountToWorker: totalAmount - feeAmount,
-    status: "held",
-    heldAt: new Date(),
-  });
+  // Keep assignment, waiting-list update, payment creation and audit log together.
+  // Without this transaction an exception after assignment could leave no payment
+  // and the Hirer would be unable to reach the Demo payment step.
+  let assignedJob;
+  try {
+    await withTransaction(async (session) => {
+      assignedJob = await Job.findOneAndUpdate(
+        { _id: job._id, hirer: req.user._id, status: "waiting" },
+        { $set: { status: "assigned", selectedWorker: workerId } },
+        { new: true, runValidators: true, session }
+      );
+      if (!assignedJob) {
+        const conflict = new Error("งานถูกเลือก Worker หรือยกเลิกไปแล้ว");
+        conflict.code = "WORKER_SELECTION_CONFLICT";
+        throw conflict;
+      }
+      const selected = await JobWaiting.updateOne(
+        { job: job._id, worker: workerId, status: "waiting" },
+        { $set: { status: "selected" } }, { session }
+      );
+      if (selected.matchedCount !== 1) {
+        const conflict = new Error("ผู้สมัครไม่อยู่ในคิวงานแล้ว");
+        conflict.code = "WORKER_SELECTION_CONFLICT";
+        throw conflict;
+      }
+      await JobWaiting.updateMany(
+        { job: job._id, worker: { $ne: workerId }, status: "waiting" },
+        { $set: { status: "not_selected" } }, { session }
+      );
+      // Hirer pays the transaction fee ON TOP of the job/service amount.
+      // Keep this aligned with the Post Job UI (5% of the base job wage).
+      const amount = Number(job.price) + Number(job.deliveryFee || 0);
+      const feePercent = Number(process.env.ESCROW_FEE_PERCENT_MIN) || 5;
+      const feeAmount = Math.round(Number(job.price) * feePercent) / 100;
+      await Payment.create([{
+        job: job._id, hirer: job.hirer, worker: workerId, amount,
+        platformFeePercent: feePercent, platformFeeAmount: feeAmount,
+        netAmountToWorker: amount,
+        status: "pending", paymentMode: "demo",
+      }], { session });
+      await logJobStatusChange({
+        jobId: job._id, previousStatus: "waiting", newStatus: "assigned",
+        changedBy: req.user._id, note: `เลือกผู้รับจ้าง ${workerId}`, session,
+      });
+    });
+  } catch (err) {
+    if (err.code === "WORKER_SELECTION_CONFLICT" || err.code === 11000 || err.hasErrorLabel?.("TransientTransactionError")) {
+      return res.status(409).json({ message: "ไม่สามารถเลือก Worker ได้ กรุณาโหลดงานใหม่" });
+    }
+    throw err;
+  }
 
   const io = req.app.get("io");
-  await notifyUser(io, {
-    userId: workerId,
-    type: "application_update",
-    title: "คุณได้รับเลือกให้ทำงานนี้",
-    message: job.title,
-    relatedEntityType: "Job",
-    relatedEntityId: job._id,
-  });
+  try {
+    await notifyUser(io, {
+      userId: workerId,
+      type: "application_update",
+      title: "คุณได้รับเลือกให้ทำงานนี้ (รอชำระ Demo)",
+      message: `งาน \"${job.title}\" รอ Hirer กดยืนยัน Mock Payment ก่อนเริ่มงาน`,
+      relatedEntityType: "Job", relatedEntityId: job._id,
+    });
+  } catch (err) { console.error("Selection notification failed:", err); }
 
   res.json({ message: "เลือกผู้รับจ้างสำเร็จ", job: assignedJob });
 });
@@ -434,6 +447,12 @@ const updateJobStatus = [
     const allowedTransitions = { assigned: "in_progress", in_progress: "awaiting_confirmation" };
     if (allowedTransitions[job.status] !== next) {
       return res.status(409).json({ message: `Cannot change status from ${job.status} to ${next}.` });
+    }
+    if (next === "in_progress") {
+      // No Worker can start until the Hirer has explicitly completed mock payment.
+      const paid = await Payment.exists({ job: job._id, worker: req.user._id, status: "held",
+        $or: [{ paymentMode: "demo" }, { paymentMode: { $exists: false } }] });
+      if (!paid) return res.status(409).json({ message: "รอ Hirer กดยืนยันการชำระเงินจำลองก่อนเริ่มงาน" });
     }
     if (next === "in_progress" && req.file) {
       return res.status(400).json({ message: "Do not attach a photo before starting the job." });

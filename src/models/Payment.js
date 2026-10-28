@@ -15,6 +15,9 @@ const paymentSchema = new mongoose.Schema(
     platformFeeAmount: { type: Number, required: true },
     netAmountToWorker: { type: Number, required: true },
 
+    // MVP simulation is never an actual transfer. Manual real-money flow comes after MVP.
+    paymentMode: { type: String, enum: ["demo", "manual"], default: "demo" },
+
     // FR-PAY-02: Pending -> Held -> Released, ทางเลือก Refunded, และ disputed ระหว่างทาง
     status: {
       type: String,

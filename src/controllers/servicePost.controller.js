@@ -124,7 +124,7 @@ const getMyIncomingRequests = asyncHandler(async (req, res) => {
 /**
  * PATCH /api/service-posts/requests/:id — FR-SERV-05, FR-SERV-07, FR-PAY-01
  * body: { action: "accept" | "decline" }
- * accept -> แปลงเป็น Job จริง + เปิด Payment (held ทันที เหมือน selectWorker — ดูหมายเหตุใน job.controller.js)
+ * accept -> creates an assigned Job with a pending DEMO payment; Hirer confirms payment in My Jobs.
  */
 const respondToServiceRequest = asyncHandler(async (req, res) => {
   const { action } = req.body;
@@ -172,9 +172,9 @@ const respondToServiceRequest = asyncHandler(async (req, res) => {
       note: `แปลงมาจาก Service Request ${request._id}`,
     });
 
-    // FR-PAY-01: เปิด Payment เข้าสถานะ held ทันที (เหตุผลเดียวกับ selectWorker ใน job.controller.js)
+    // Create pending DEMO payment, not held. Hirer must confirm the mock payment button.
     const feePercent = Number(process.env.ESCROW_FEE_PERCENT_MIN) || 5;
-    const feeAmount = Math.round((post.fee * feePercent) / 100);
+    const feeAmount = Math.round(Number(post.fee) * feePercent) / 100;
     await Payment.create({
       job: job._id,
       hirer: request.hirer,
@@ -182,9 +182,9 @@ const respondToServiceRequest = asyncHandler(async (req, res) => {
       amount: post.fee,
       platformFeePercent: feePercent,
       platformFeeAmount: feeAmount,
-      netAmountToWorker: post.fee - feeAmount,
-      status: "held",
-      heldAt: new Date(),
+      netAmountToWorker: post.fee, // Hirer pays 5% fee on top of worker wage (Demo)
+      status: "pending",
+      paymentMode: "demo",
     });
 
     post.currentOrderCount += 1;

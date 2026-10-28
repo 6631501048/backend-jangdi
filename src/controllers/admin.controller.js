@@ -16,6 +16,37 @@ const getPendingJobs = asyncHandler(async (req, res) => {
 });
 
 /**
+ * GET /api/admin/jobs?status=all|pending_review|rejected|waiting|...
+ * Full lifecycle overview; approval is a separate operation from job status.
+ * Read-only except pending_review actions. Server-side pagination avoids an unbounded list.
+ */
+const getAllJobs = asyncHandler(async (req, res) => {
+  const known = ["pending_filter", "pending_review", "rejected", "waiting", "assigned", "in_progress", "awaiting_confirmation", "completed", "cancelled", "disputed"];
+  const status = String(req.query.status || "all");
+  if (status !== "all" && !known.includes(status)) return res.status(400).json({ message: "สถานะงานไม่ถูกต้อง" });
+  const page = Math.max(1, Math.min(100000, Number.parseInt(req.query.page, 10) || 1));
+  const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit, 10) || 20));
+  const search = String(req.query.search || "").trim().slice(0, 100);
+  const filter = status === "all" ? {} : { status };
+  if (search) {
+    const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    filter.$or = [{ title: { $regex: escaped, $options: "i" } }, { description: { $regex: escaped, $options: "i" } }];
+  }
+  const [jobs, total, counts] = await Promise.all([
+    Job.find(filter)
+      .select("title description category status hirer selectedWorker price deliveryFee scheduledAt createdAt updatedAt approvedAt approvedBy rejectionReason cancelReason cancelledAt proofSubmittedAt completionConfirmedAt")
+      .populate("hirer", "fullName email")
+      .populate("selectedWorker", "fullName")
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit),
+    Job.countDocuments(filter),
+    Job.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
+  ]);
+  res.json({ jobs, total, page, limit, totalPages: Math.ceil(total / limit), counts: Object.fromEntries(counts.map((row) => [row._id, row.count])) });
+});
+
+/**
  * POST /api/admin/jobs/:id/approve
  * FR-JOB-05/06, FR-MATCH-01/02: อนุมัติงาน -> แจ้ง Hirer -> แจ้ง Worker ในรัศมี 2km ภายใน 1 นาที
  */
@@ -288,7 +319,7 @@ const resolveSos = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
-  getPendingJobs, approveJob, rejectJob,
+  getPendingJobs, getAllJobs, approveJob, rejectJob,
   getDashboard, getUsers, updateUserStatus,
   getEscrowPayments, decideRefund,
   getReports, resolveReport,

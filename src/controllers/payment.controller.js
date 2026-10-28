@@ -11,8 +11,8 @@ const { notifyUser } = require("../services/notification.service");
  * มุมมองสลับตาม currentRole ของผู้ใช้ (บัญชีเดียวสลับ hirer/worker ได้ตาม FR-AUTH-06):
  *   - worker: ดูเงินที่ตัวเอง "ได้รับ" (netAmountToWorker หลังหักค่าธรรมเนียม)
  *   - hirer:  ดูเงินที่ตัวเอง "จ่ายออกไป" (amount เต็มก่อนหักค่าธรรมเนียม)
- * หมายเหตุ: "released" หมายถึงเงินที่ Admin โอนเข้าบัญชีธนาคารของ worker ไปแล้วจริง (FR-PAY-05)
- * ไม่มี wallet กลางในแอปที่ต้อง "เติมเงิน" หรือ "ถอน" — ยึดตามระบบ escrow แบบ manual slip ใน proposal
+ * MVP: pending / held / released are simulated ledger states, not bank transfers.
+ * The admin transfer and real-slip procedure belong to the post-MVP payment sprint.
  */
 const getWallet = asyncHandler(async (req, res) => {
   const isHirer = req.user.currentRole === "hirer";
@@ -31,15 +31,15 @@ const getWallet = asyncHandler(async (req, res) => {
 
   if (isHirer) {
     res.json({
-      totalPaid: totals.released, // จ่ายออกไปจริงแล้ว (โอนเข้าบัญชี worker ตอน confirm-completion)
-      inEscrow: totals.held, // อยู่ใน Escrow รองาน worker ทำเสร็จ+ยืนยัน
-      pendingPayment: totals.pending, // เลือก worker แล้วแต่ยังไม่มีสลิปโอนเข้า Escrow (FR-PAY-04)
+      totalPaid: totals.released, // Demo released records, not bank transfers
+      inEscrow: totals.held, // Demo held status
+      pendingPayment: totals.pending, // Worker selected but mock payment button not yet confirmed
     });
   } else {
     res.json({
-      availableBalance: totals.released, // โอนเข้าบัญชี worker แล้วจริง (FR-PAY-05)
-      pendingBalance: totals.pending, // รอผู้ว่าจ้างโอนเงินเข้า Escrow
-      inProgressBalance: totals.held, // อยู่ใน Escrow รอ Hirer ยืนยันงานเสร็จ
+      availableBalance: totals.released, // Demo released state (no money transferred)
+      pendingBalance: totals.pending, // Waiting for mock payment button
+      inProgressBalance: totals.held, // Simulated held status
     });
   }
 });
@@ -98,6 +98,47 @@ const getTransactions = asyncHandler(async (req, res) => {
   res.json(transactions);
 });
 
+/** Only the Job participants may inspect the demo payment status. */
+const getMockPayment = asyncHandler(async (req, res) => {
+  const payment = await Payment.findOne({ job: req.params.jobId });
+  if (!payment) return res.status(404).json({ message: "ไม่พบรายการชำระเงินสำหรับงานนี้" });
+  const userId = String(req.user._id);
+  if (!req.user.isAdmin && userId !== String(payment.hirer) && userId !== String(payment.worker)) {
+    return res.status(403).json({ message: "ไม่มีสิทธิ์ดูรายการชำระเงินนี้" });
+  }
+  res.json({ jobId: payment.job, status: payment.status, paymentMode: payment.paymentMode || "demo",
+    amount: payment.amount, platformFeeAmount: payment.platformFeeAmount,
+    totalDue: Math.round((payment.amount + payment.platformFeeAmount) * 100) / 100,
+    heldAt: payment.heldAt, releasedAt: payment.releasedAt });
+});
+
+/**
+ * POST /api/payments/:jobId/mock-confirm
+ * Only the Hirer can push a newly selected job's DEMO payment pending -> held.
+ * Atomic status guard prevents double-confirm and prevents use on real/manual payments.
+ * This call never contacts a bank or charges a card.
+ */
+const confirmMockPayment = asyncHandler(async (req, res) => {
+  const { Job } = require("../models");
+  const job = await Job.findById(req.params.jobId);
+  if (!job) return res.status(404).json({ message: "ไม่พบงานนี้" });
+  if (String(job.hirer) !== String(req.user._id)) return res.status(403).json({ message: "เฉพาะผู้ว่าจ้างของงานนี้เท่านั้น" });
+  if (job.status !== "assigned") return res.status(409).json({ message: "งานไม่ได้อยู่ในสถานะรอเริ่มงาน" });
+  const payment = await Payment.findOneAndUpdate(
+    { job: job._id, hirer: req.user._id, worker: job.selectedWorker, status: "pending", paymentMode: "demo" },
+    { $set: { status: "held", heldAt: new Date() } },
+    { new: true, runValidators: true }
+  );
+  if (!payment) return res.status(409).json({ message: "รายการนี้เคยชำระแบบจำลองแล้ว หรือไม่ใช่รายการ Demo ที่รอชำระ" });
+  try {
+    await notifyUser(req.app.get("io"), { userId: payment.worker, type: "payment_update",
+      title: "ชำระเงินจำลองแล้ว เริ่มงานได้", message: `งาน \"${job.title}\" พร้อมเริ่มแล้ว (Demo เท่านั้น ไม่มีการโอนเงินจริง)`,
+      relatedEntityType: "Payment", relatedEntityId: payment._id });
+  } catch (err) { console.error("Mock payment notification failed:", err); }
+  res.json({ message: "บันทึกการชำระเงิน DEMO สำเร็จ (ไม่มีการโอนเงินจริง)",
+    payment: { jobId: job._id, paymentMode: "demo", status: payment.status, heldAt: payment.heldAt } });
+});
+
 /* ---------- อัปโหลดสลิปโอนเงิน (FR-PAY-04) ---------- */
 const SLIP_DIR = path.join(__dirname, "..", "..", "uploads", "payment-slips");
 fs.mkdirSync(SLIP_DIR, { recursive: true });
@@ -115,6 +156,15 @@ const slipUpload = multer({
  * inbound = Hirer โอนเงินเข้า Escrow, outbound = Admin โอนเงินออกให้ Worker/คืนเงิน Hirer
  */
 const uploadSlip = [
+  // Validate before Multer writes to disk. Demo mode must never accept an actual slip.
+  asyncHandler(async (req, res, next) => {
+    const payment = await Payment.findOne({ job: req.params.jobId });
+    if (!payment) return res.status(404).json({ message: "ไม่พบรายการชำระเงินของงานนี้" });
+    if ((payment.paymentMode || "demo") === "demo") {
+      return res.status(409).json({ message: "Demo Payment ไม่รับสลิปเงินจริง กรุณาใช้ปุ่มชำระเงินจำลอง" });
+    }
+    next();
+  }),
   slipUpload.single("slip"),
   asyncHandler(async (req, res) => {
     const { direction } = req.body;
@@ -126,11 +176,20 @@ const uploadSlip = [
     const payment = await Payment.findOne({ job: req.params.jobId });
     if (!payment) return res.status(404).json({ message: "ไม่พบรายการชำระเงินของงานนี้" });
 
+    if ((payment.paymentMode || "demo") === "demo") {
+      return res.status(409).json({ message: "Demo Payment ไม่รับสลิปเงินจริง กรุณาใช้ปุ่มชำระเงินจำลอง" });
+    }
     const isParty = [String(payment.hirer), String(payment.worker)].includes(String(req.user._id));
     if (!isParty && !req.user.isAdmin) {
       return res.status(403).json({ message: "คุณไม่เกี่ยวข้องกับรายการชำระเงินนี้" });
     }
 
+    if (direction === "inbound" && String(payment.hirer) !== String(req.user._id)) {
+      return res.status(403).json({ message: "เฉพาะ Hirer เท่านั้นที่ส่งหลักฐานขาเข้าได้" });
+    }
+    if (direction === "outbound" && !req.user.isAdmin) {
+      return res.status(403).json({ message: "เฉพาะ Admin เท่านั้นที่ส่งหลักฐานขาออกได้" });
+    }
     const slipUrl = `/uploads/payment-slips/${req.file.filename}`;
     if (direction === "inbound") {
       payment.inboundSlipUrl = slipUrl;
@@ -180,4 +239,4 @@ const raiseDispute = asyncHandler(async (req, res) => {
   res.json({ message: "ยื่นข้อพิพาทสำเร็จ รอผู้ดูแลระบบตรวจสอบ", payment });
 });
 
-module.exports = { getWallet, getSummary, getTransactions, uploadSlip, raiseDispute };
+module.exports = { getWallet, getSummary, getTransactions, getMockPayment, confirmMockPayment, uploadSlip, raiseDispute };

@@ -1,7 +1,7 @@
 const router = require("express").Router();
 const { protect, adminOnly } = require("../middleware/auth.middleware");
 const {
-  getPendingJobs, approveJob, rejectJob,
+  getPendingJobs, getAllJobs, approveJob, rejectJob,
   getDashboard, getUsers, updateUserStatus,
   getEscrowPayments, decideRefund,
   getReports, resolveReport,
@@ -11,7 +11,8 @@ const {
 router.use(protect, adminOnly); // NFR-SEC-04: ทุก route ในนี้ต้องเป็น Admin เท่านั้น
 
 router.get("/dashboard", getDashboard); // FR-ADMIN-01
-router.get("/jobs/pending", getPendingJobs); // FR-ADMIN-02
+router.get("/jobs/pending", getPendingJobs);
+router.get("/jobs", getAllJobs); // full lifecycle view (Admin only) // FR-ADMIN-02
 router.post("/jobs/:id/approve", approveJob); // FR-JOB-05–06, FR-MATCH-01–02
 router.post("/jobs/:id/reject", rejectJob); // FR-ADMIN-02
 router.get("/users", getUsers); // FR-ADMIN-03
