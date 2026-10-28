@@ -518,6 +518,78 @@ const updateJobStatus = [
   }),
 ];
 
+/** PATCH /api/jobs/:id/completion-proof — Worker can replace evidence until Hirer confirms. */
+const replaceCompletionProof = [
+  uploadProof,
+  asyncHandler(async (req, res) => {
+    const job = await Job.findById(req.params.id);
+    if (!job) return res.status(404).json({ message: "Job not found." });
+    if (String(job.selectedWorker) !== String(req.user._id)) {
+      return res.status(403).json({ message: "Only the selected Worker can replace this proof." });
+    }
+    if (job.status !== "awaiting_confirmation" || job.completionConfirmedAt) {
+      return res.status(409).json({ message: "Proof can only be replaced before Hirer confirms completion." });
+    }
+    if (!req.file) return res.status(400).json({ message: "กรุณาเลือกรูปหลักฐานก่อนยืนยัน" });
+    const kind = detectProofImage(req.file.buffer);
+    if (!kind || kind.mime !== req.file.mimetype) {
+      return res.status(400).json({ message: "ไฟล์ต้องเป็นรูป JPG, PNG หรือ WebP ที่ถูกต้อง" });
+    }
+    // Write the new image first; the old image must remain readable until the
+    // Job update commits. The CAS also races safely with Hirer confirmation.
+    const newFilename = `${job._id}-${randomUUID()}${kind.ext}`;
+    const newPath = path.join(PROOF_DIR, newFilename);
+    const newProofUrl = `/uploads/job-proofs/${newFilename}`;
+    await fs.promises.writeFile(newPath, req.file.buffer, { flag: "wx" });
+    let updated;
+    let notification;
+    try {
+      await withTransaction(async (session) => {
+        updated = await Job.findOneAndUpdate(
+          {
+            _id: job._id, selectedWorker: req.user._id,
+            status: "awaiting_confirmation", completionConfirmedAt: null,
+            completionProofUrl: job.completionProofUrl,
+          },
+          { $set: { completionProofUrl: newProofUrl, proofSubmittedAt: new Date() } },
+          { new: true, runValidators: true, session }
+        );
+        if (!updated) {
+          const conflict = new Error("Proof update conflicts with job confirmation");
+          conflict.code = "JOB_PROOF_CONFLICT";
+          throw conflict;
+        }
+        await logJobStatusChange({
+          jobId: updated._id, previousStatus: "awaiting_confirmation",
+          newStatus: "awaiting_confirmation", changedBy: req.user._id,
+          note: "Worker replaced completion proof", session,
+        });
+        notification = await createNotification({
+          userId: updated.hirer,
+          type: "job_status_change",
+          title: "Completion proof updated",
+          message: `Worker updated the photo for "${updated.title}". Please review the latest proof.`,
+          relatedEntityType: "Job", relatedEntityId: updated._id,
+        }, session);
+      });
+    } catch (err) {
+      await fs.promises.unlink(newPath).catch(() => {});
+      if (err.code === "JOB_PROOF_CONFLICT") {
+        return res.status(409).json({ message: "Job has changed or Hirer confirmed it. Refresh and try again." });
+      }
+      throw err;
+    }
+    // Delete the replaced local file ONLY after the database commit. Preserve
+    // older/non-local proof paths rather than following arbitrary file URLs.
+    const matchOld = /^\/uploads\/job-proofs\/([a-zA-Z0-9_.-]+)$/.exec(job.completionProofUrl || "");
+    if (matchOld && matchOld[1] !== "." && matchOld[1] !== ".." && matchOld[1] !== newFilename) {
+      await fs.promises.unlink(path.join(PROOF_DIR, matchOld[1])).catch(() => {});
+    }
+    await deliverNotification(req.app.get("io"), notification);
+    res.json({ message: "เปลี่ยนรูปหลักฐานเรียบร้อยแล้ว กำลังรอ Hirer ยืนยัน", job: updated });
+  }),
+];
+
 /** GET /api/jobs/:id/completion-proof — only the Hirer, selected Worker or Admin. */
 const getCompletionProof = asyncHandler(async (req, res) => {
   const job = await Job.findById(req.params.id);
@@ -664,5 +736,5 @@ const confirmCompletion = asyncHandler(async (req, res) => {
 
 module.exports = {
   createJob, getMyJobs, getJobById, getJobTimeline, cancelJob,
-  getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion, getCompletionProof,
+  getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion, getCompletionProof, replaceCompletionProof,
 };

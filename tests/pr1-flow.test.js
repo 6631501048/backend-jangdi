@@ -264,3 +264,58 @@ test("Authenticated image fetch refuses outsiders and serves the real image type
 });
 
 test.after(() => { try { fs.unlinkSync(proofPath); } catch {} });
+
+test("Worker can replace a submitted photo before Hirer confirmation; old bytes are retired only after commit", async () => {
+  seed("awaiting_confirmation", true);
+  const replaceHandler = controller.replaceCompletionProof[1];
+  const firstPath = proofPath;
+  const response = await call(replaceHandler, {
+    ...reqFor("worker-1"),
+    file: { buffer: png, mimetype: "image/png" },
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(store.job.status, "awaiting_confirmation");
+  assert.match(store.job.completionProofUrl, /^\/uploads\/job-proofs\/job-1-[\w-]+\.png$/);
+  assert.equal(fs.existsSync(firstPath), false);
+  const newPath = path.join(path.dirname(firstPath), path.basename(store.job.completionProofUrl));
+  assert.equal(fs.readFileSync(newPath).equals(png), true);
+  assert.equal(store.logs[0].note, "Worker replaced completion proof");
+  assert.equal(store.notifications.length, 1);
+  assert.equal((await call(controller.getCompletionProof, reqFor("worker-1"))).statusCode, 200);
+  fs.unlinkSync(newPath);
+});
+
+test("Proof replacement is forbidden after completion, for non-participants, or for invalid photo data", async () => {
+  seed("completed", true);
+  let response = await call(controller.replaceCompletionProof[1], {
+    ...reqFor("worker-1"), file: { buffer: png, mimetype: "image/png" },
+  });
+  assert.equal(response.statusCode, 409);
+  seed("awaiting_confirmation", true);
+  response = await call(controller.replaceCompletionProof[1], {
+    ...reqFor("other-worker"), file: { buffer: png, mimetype: "image/png" },
+  });
+  assert.equal(response.statusCode, 403);
+  response = await call(controller.replaceCompletionProof[1], {
+    ...reqFor("worker-1"), file: { buffer: Buffer.from("fake bytes"), mimetype: "image/png" },
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal(store.job.completionProofUrl, "/uploads/job-proofs/pr1-confirm-picture.jpg");
+  assert.equal(fs.existsSync(proofPath), true);
+});
+
+test("Proof update conflict keeps the prior picture and deletes the new uncommitted photo", async () => {
+  seed("awaiting_confirmation", true);
+  const before = new Set(fs.readdirSync(path.dirname(proofPath)));
+  const original = models.Job.findOneAndUpdate;
+  models.Job.findOneAndUpdate = async () => null;
+  try {
+    const response = await call(controller.replaceCompletionProof[1], {
+      ...reqFor("worker-1"), file: { buffer: png, mimetype: "image/png" },
+    });
+    assert.equal(response.statusCode, 409);
+    assert.equal(store.job.completionProofUrl, "/uploads/job-proofs/pr1-confirm-picture.jpg");
+    assert.equal(fs.existsSync(proofPath), true);
+    assert.deepEqual(new Set(fs.readdirSync(path.dirname(proofPath))), before);
+  } finally { models.Job.findOneAndUpdate = original; }
+});

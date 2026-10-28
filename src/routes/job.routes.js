@@ -2,7 +2,7 @@ const router = require("express").Router();
 const { protect, requireRole, requireVerifiedEmail } = require("../middleware/auth.middleware");
 const {
   createJob, getMyJobs, getJobById, getJobTimeline, cancelJob,
-  getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion, getCompletionProof,
+  getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion, getCompletionProof, replaceCompletionProof,
 } = require("../controllers/job.controller");
 const { submitReview } = require("../controllers/review.controller");
 
@@ -18,6 +18,7 @@ router.post("/:id/apply", protect, requireRole("worker"), requireVerifiedEmail, 
 router.get("/:id/applicants", protect, requireRole("hirer"), getApplicants); // FR-MATCH-03
 router.post("/:id/select-worker", protect, requireRole("hirer"), requireVerifiedEmail, selectWorker); // FR-MATCH-04–06, FR-PAY-01
 router.get("/:id/completion-proof", protect, getCompletionProof); // Authorized evidence image (Task 05)
+router.patch("/:id/completion-proof", protect, requireRole("worker"), ...replaceCompletionProof); // Replace until Hirer confirms
 router.patch("/:id/status", protect, requireRole("worker"), ...updateJobStatus); // FR-TRACK-01/03/05
 router.post("/:id/confirm-completion", protect, requireRole("hirer"), confirmCompletion); // FR-TRACK-04, FR-PAY-05
 router.post("/:id/cancel", protect, cancelJob); // FR-JOB-07
