@@ -76,6 +76,16 @@ const userSchema = new mongoose.Schema(
       default: "active",
     },
 
+    // FR-ADMIN-03: เก็บเหตุผลและผู้ดำเนินการในเอกสารเดียวกับสถานะ เพื่อไม่ให้สถานะเปลี่ยนโดยไม่มีประวัติ
+    moderationHistory: { type: [new mongoose.Schema({
+      action: { type: String, enum: ["warn", "suspend", "clear"], required: true },
+      previousStatus: { type: String, required: true },
+      newStatus: { type: String, required: true },
+      reason: { type: String, required: true, trim: true, maxlength: 500 },
+      performedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+      performedAt: { type: Date, required: true },
+    }, { _id: false })], select: false, default: [] },
+
     // ตำแหน่งปัจจุบันโดยประมาณของผู้ใช้ (ใช้คำนวณระยะทางตอน browse/matching)
     // หมายเหตุ: ห้ามใส่ default ให้ "type" ที่นี่ — ถ้าใส่ Mongoose จะสร้าง
     // { type: "Point" } แบบไม่มี coordinates ให้อัตโนมัติทุกครั้งที่สร้าง user ใหม่
