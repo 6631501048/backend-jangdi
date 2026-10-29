@@ -1,4 +1,4 @@
-﻿const mongoose = require("mongoose");
+const mongoose = require("mongoose");
 
 /**
  * JOB
@@ -82,5 +82,7 @@ const jobSchema = new mongoose.Schema(
 
 jobSchema.index({ location: "2dsphere" });
 jobSchema.index({ status: 1, category: 1 });
+// An accepted Service Request must never create more than one Job.
+jobSchema.index({ originServiceRequest: 1 }, { unique: true, partialFilterExpression: { originServiceRequest: { $type: "objectId" } } });
 
 module.exports = mongoose.model("Job", jobSchema);

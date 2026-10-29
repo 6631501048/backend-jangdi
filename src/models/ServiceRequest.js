@@ -9,6 +9,14 @@ const serviceRequestSchema = new mongoose.Schema(
     servicePost: { type: mongoose.Schema.Types.ObjectId, ref: "ServicePost", required: true },
     hirer: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     orderDetails: { type: String, required: true },
+    // MVP-02: ค่าในฟอร์มจริง ไม่สรุปยอดสินค้าจากข้อความด้วยการเดา
+    orderData: {
+      from: { type: String, default: "" },
+      to: { type: String, default: "" },
+      estimatedDelivery: { type: String, default: "" },
+      requirements: { type: String, default: "" },
+      itemBudget: { type: Number, default: null, min: 0 },
+    },
 
     // FR-SERV-05 / FR-SERV-07: pending -> accepted (แปลงเป็น Job) / declined
     status: {

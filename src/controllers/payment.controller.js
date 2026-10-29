@@ -213,20 +213,22 @@ const uploadSlip = [
  */
 const raiseDispute = asyncHandler(async (req, res) => {
   const { reason } = req.body;
-  if (!reason) return res.status(400).json({ message: "กรุณาระบุเหตุผลของข้อพิพาท" });
+  if (typeof reason !== "string" || reason.trim().length < 10 || reason.trim().length > 1000) {
+    return res.status(400).json({ message: "กรุณาระบุเหตุผลข้อพิพาท 10–1000 ตัวอักษร" });
+  }
 
   const payment = await Payment.findOne({ job: req.params.jobId });
   if (!payment) return res.status(404).json({ message: "ไม่พบรายการชำระเงินของงานนี้" });
 
   const isParty = [String(payment.hirer), String(payment.worker)].includes(String(req.user._id));
   if (!isParty) return res.status(403).json({ message: "คุณไม่เกี่ยวข้องกับงานนี้" });
-  if (["released", "refunded"].includes(payment.status)) {
-    return res.status(400).json({ message: `ไม่สามารถยื่นข้อพิพาทได้เพราะเงินอยู่ในสถานะ ${payment.status} แล้ว` });
+  if (!["pending", "held"].includes(payment.status)) {
+    return res.status(409).json({ message: `ไม่สามารถยื่นข้อพิพาทซ้ำหรือหลังปิดรายการได้ (สถานะ: ${payment.status})` });
   }
 
   payment.status = "disputed";
   payment.disputeRaisedBy = req.user._id;
-  payment.disputeReason = reason;
+  payment.disputeReason = reason.trim();
   await payment.save();
 
   const { Job } = require("../models");

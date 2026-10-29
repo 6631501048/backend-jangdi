@@ -4,7 +4,7 @@ const {
   createJob, getMyJobs, getJobById, getJobTimeline, cancelJob,
   getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion, getCompletionProof, replaceCompletionProof,
 } = require("../controllers/job.controller");
-const { submitReview } = require("../controllers/review.controller");
+const { submitReview, getReviewStatus } = require("../controllers/review.controller");
 
 // หมายเหตุ: route แบบ literal path (เช่น /my, /my-as-worker) ต้องมาก่อน /:id เสมอ
 router.get("/", getFeed); // FR-BROWSE-01–02
@@ -22,6 +22,7 @@ router.patch("/:id/completion-proof", protect, requireRole("worker"), ...replace
 router.patch("/:id/status", protect, requireRole("worker"), ...updateJobStatus); // FR-TRACK-01/03/05
 router.post("/:id/confirm-completion", protect, requireRole("hirer"), confirmCompletion); // FR-TRACK-04, FR-PAY-05
 router.post("/:id/cancel", protect, cancelJob); // FR-JOB-07
+router.get("/:id/review-status", protect, getReviewStatus);
 router.post("/:id/review", protect, submitReview); // FR-REV-01–03
 
 module.exports = router;

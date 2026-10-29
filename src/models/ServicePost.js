@@ -30,6 +30,7 @@ const servicePostSchema = new mongoose.Schema(
       enum: ["active", "closed", "expired"],
       default: "active",
     },
+    closeReason: { type: String, enum: ["manual", "capacity", null], default: null },
   },
   { timestamps: true }
 );

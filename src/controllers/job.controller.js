@@ -4,7 +4,7 @@ const path = require("path");
 const fs = require("fs");
 const { randomUUID } = require("crypto");
 const { detectProofImage } = require("../utils/proofImage");
-const { Job, JobWaiting, Payment, JobLog } = require("../models");
+const { Job, JobWaiting, Payment, JobLog, ServiceRequest, ServicePost } = require("../models");
 const { checkContent } = require("../utils/contentFilter");
 const { logJobStatusChange } = require("../services/jobLog.service");
 const { createNotification, deliverNotification, notifyUser } = require("../services/notification.service");
@@ -685,6 +685,22 @@ const confirmCompletion = asyncHandler(async (req, res) => {
         const missingPayment = new Error("The demo payment is not in held state.");
         missingPayment.code = "PAYMENT_NOT_HELD";
         throw missingPayment;
+      }
+
+      // Service Post quotas are concurrent, not lifetime totals. When a service-origin
+      // job completes, release its slot; only reopen auto-capacity closures (never manual ones).
+      if (updated.originServiceRequest) {
+        const origin = await ServiceRequest.findById(updated.originServiceRequest).session(session);
+        if (origin?.servicePost) {
+          const servicePost = await ServicePost.findById(origin.servicePost).session(session);
+          if (servicePost && servicePost.currentOrderCount > 0) {
+            const reopen = servicePost.status === "closed" && servicePost.closeReason === "capacity" &&
+              servicePost.availabilityEnd > new Date();
+            const change = { $inc: { currentOrderCount: -1 } };
+            if (reopen) change.$set = { status: "active", closeReason: null };
+            await ServicePost.updateOne({ _id: servicePost._id, currentOrderCount: { $gt: 0 } }, change, { session });
+          }
+        }
       }
 
       await logJobStatusChange({

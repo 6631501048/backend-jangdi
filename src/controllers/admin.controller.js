@@ -1,6 +1,6 @@
 const asyncHandler = require("express-async-handler");
 const mongoose = require("mongoose");
-const { Job, User, Payment, Report, Sos } = require("../models");
+const { Job, User, Payment, Report, Sos, ServicePost } = require("../models");
 const { logJobStatusChange } = require("../services/jobLog.service");
 const { notifyUser } = require("../services/notification.service");
 const { notifyNearbyWorkers } = require("../services/matching.service");
@@ -58,6 +58,31 @@ const getAllJobs = asyncHandler(async (req, res) => {
     Job.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
   ]);
   res.json({ jobs, total, page, limit, totalPages: Math.ceil(total / limit), counts: Object.fromEntries(counts.map((row) => [row._id, row.count])) });
+});
+
+/** GET /api/admin/service-posts — read-only overview of Worker service listings */
+const getAllServicePosts = asyncHandler(async (req, res) => {
+  const allowed = ["all", "active", "closed", "expired"];
+  const status = String(req.query.status || "all");
+  if (!allowed.includes(status)) return res.status(400).json({ message: "สถานะประกาศบริการไม่ถูกต้อง" });
+  const rawPage = req.query.page == null ? "1" : String(req.query.page);
+  const rawLimit = req.query.limit == null ? "20" : String(req.query.limit);
+  if (!/^[1-9]\d{0,8}$/.test(rawPage) || !/^[1-9]\d{0,8}$/.test(rawLimit)) return res.status(400).json({ message: "page และ limit ต้องเป็นจำนวนเต็มบวก" });
+  if (typeof req.query.search === "object") return res.status(400).json({ message: "search ต้องเป็นข้อความ" });
+  const search = String(req.query.search || "").trim().slice(0, 100);
+  const page = Math.min(100000, Number(rawPage));
+  const limit = Math.min(100, Number(rawLimit));
+  const filter = status === "all" ? {} : { status };
+  if (search) {
+    const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    filter.$or = [{ title: { $regex: escaped, $options: "i" } }, { description: { $regex: escaped, $options: "i" } }];
+  }
+  const [posts, total] = await Promise.all([
+    ServicePost.find(filter).select("worker title description category fee status availabilityEnd createdAt currentOrderCount maxSimultaneousOrders")
+      .populate("worker", "fullName email").sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit),
+    ServicePost.countDocuments(filter),
+  ]);
+  res.json({ posts, total, page, limit, totalPages: Math.ceil(total / limit) });
 });
 
 /**
@@ -294,6 +319,8 @@ const getReports = asyncHandler(async (req, res) => {
   const reports = await Report.find(status ? { status } : {})
     .populate("reporter", "fullName email")
     .populate("reportedUser", "fullName email accountStatus")
+    .populate("job", "title")
+    .populate("resolvedBy", "fullName")
     .sort({ createdAt: -1 });
   res.json(reports);
 });
@@ -327,30 +354,49 @@ const resolveReport = asyncHandler(async (req, res) => {
  */
 const getSosList = asyncHandler(async (req, res) => {
   const { status } = req.query;
-  const query = status ? { status } : {};
-  const list = await Sos.find(query)
+  if (status != null && !["active", "resolved"].includes(status)) {
+    return res.status(400).json({ message: "สถานะ SOS ไม่ถูกต้อง" });
+  }
+  const list = await Sos.find(status ? { status } : {})
     .populate("worker", "fullName phone lineId")
     .populate("job", "title")
-    .sort({ createdAt: -1 });
+    .populate("resolvedBy", "fullName")
+    .sort({ triggeredAt: -1 });
   res.json(list);
 });
 
-/**
- * POST /api/admin/sos/:id/resolve — FR-SOS-04
- * body: { adminNotes }
- */
+/** POST /api/admin/sos/:id/resolve — close active cases only, with mandatory audit notes. */
 const resolveSos = asyncHandler(async (req, res) => {
-  const sos = await Sos.findByIdAndUpdate(
-    req.params.id,
-    { status: "resolved", resolvedAt: new Date(), resolvedBy: req.user._id, adminNotes: req.body?.adminNotes || null },
-    { new: true }
+  if (!validId(req.params.id)) return res.status(400).json({ message: "SOS ID ไม่ถูกต้อง" });
+  const notes = req.body?.adminNotes;
+  if (typeof notes !== "string" || notes.trim().length < 5 || notes.trim().length > 1000) {
+    return res.status(400).json({ message: "กรุณาระบุหมายเหตุการปิดเคส 5-1000 ตัวอักษร" });
+  }
+  const sos = await Sos.findOneAndUpdate(
+    { _id: req.params.id, status: "active" },
+    { $set: { status: "resolved", resolvedAt: new Date(), resolvedBy: req.user._id, adminNotes: notes.trim() } },
+    { new: true, runValidators: true }
   );
-  if (!sos) return res.status(404).json({ message: "ไม่พบสัญญาณ SOS นี้" });
+  if (!sos) {
+    const current = await Sos.findById(req.params.id);
+    return current
+      ? res.status(409).json({ message: "เคส SOS นี้ถูกปิดแล้วหรือมี Admin ดำเนินการไปก่อน" })
+      : res.status(404).json({ message: "ไม่พบสัญญาณ SOS นี้" });
+  }
+  // Do not revert a successful close when notification delivery fails.
+  try {
+    await notifyUser(req.app.get("io"), {
+      userId: sos.worker, type: "system",
+      title: "อัปเดตสัญญาณ SOS",
+      message: "ผู้ดูแลระบบได้บันทึกการดำเนินการกับสัญญาณ SOS ของคุณแล้ว",
+      relatedEntityType: "Sos", relatedEntityId: sos._id,
+    });
+  } catch (err) { console.error("SOS resolution notification failed:", err); }
   res.json({ message: "ปิดเคส SOS สำเร็จ", sos });
 });
 
 module.exports = {
-  getPendingJobs, getAllJobs, approveJob, rejectJob,
+  getPendingJobs, getAllJobs, getAllServicePosts, approveJob, rejectJob,
   getDashboard, getUsers, updateUserStatus,
   getEscrowPayments, decideRefund,
   getReports, resolveReport,
