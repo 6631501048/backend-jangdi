@@ -23,6 +23,9 @@ const store = { job: null, payment: null, logs: [], notifications: [], delivered
 let transactionQueue = Promise.resolve();
 const models = {
   Job: {
+    findOne: (query) => ({
+      select: async () => store.job && String(store.job._id) === String(query._id) && store.job.completionProofUrl === query.completionProofUrl ? { ...store.job } : null,
+    }),
     findById: async (id) => store.job && String(store.job._id) === String(id) ? { ...store.job } : null,
     findOneAndUpdate: async (query, update) => {
       if (!store.job || String(query._id) !== String(store.job._id) || query.status !== store.job.status) return null;
@@ -233,8 +236,10 @@ test("Worker proof submission switches to awaiting_confirmation and records the 
   assert.match(store.job.completionProofUrl, /^\/uploads\/job-proofs\/job-1-[\w-]+\.jpg$/);
   const filename = path.basename(store.job.completionProofUrl);
   const file = path.join(__dirname, "..", "uploads", "job-proofs", filename);
-  assert.deepEqual(fs.readFileSync(file), jpeg);
-  fs.unlinkSync(file);
+  assert.equal(store.job.completionProofStorage, "mongodb");
+  assert.deepEqual(store.job.completionProofData, jpeg);
+  assert.equal(fs.existsSync(file), false, "new proof must not depend on a local uploads folder");
+  assert.deepEqual((await call(controller.getCompletionProof, reqFor())).body, jpeg);
 });
 
 test("Wrong file signature or non-worker cannot submit proof", async () => {
@@ -244,6 +249,34 @@ test("Wrong file signature or non-worker cannot submit proof", async () => {
   const other = await call(secondMiddleware, { ...reqFor("someone-else", { next: "awaiting_confirmation" }), file: { buffer: jpeg, mimetype: "image/jpeg" } });
   assert.equal(other.statusCode, 403);
   assert.equal(store.job.status, "in_progress");
+});
+
+test("Hirer on a backend without the Worker's local uploads can read and confirm the shared proof", async () => {
+  seed("in_progress", false);
+  await call(secondMiddleware, { ...reqFor("worker-1", { next: "awaiting_confirmation" }), file: { buffer: jpeg, mimetype: "image/jpeg" } });
+  const before = process.env.JOB_PROOF_DIR;
+  process.env.JOB_PROOF_DIR = path.join(__dirname, "missing-other-computer-uploads");
+  try {
+    const image = await call(controller.getCompletionProof, reqFor());
+    assert.equal(image.statusCode, 200);
+    assert.deepEqual(image.body, jpeg);
+    assert.equal((await call(controller.getCompletionProof, reqFor("outsider"))).statusCode, 403);
+    const result = await call(controller.confirmCompletion, reqFor());
+    assert.equal(result.statusCode, 200);
+    assert.equal(store.job.status, "completed");
+  } finally {
+    if (before === undefined) delete process.env.JOB_PROOF_DIR;
+    else process.env.JOB_PROOF_DIR = before;
+  }
+});
+
+test("proof bytes roll back with the job when notification persistence fails", async () => {
+  seed("in_progress", false);
+  store.failLog = true;
+  await assert.rejects(call(secondMiddleware, { ...reqFor("worker-1", { next: "awaiting_confirmation" }), file: { buffer: jpeg, mimetype: "image/jpeg" } }));
+  assert.equal(store.job.status, "in_progress");
+  assert.equal(store.job.completionProofUrl, null);
+  assert.equal(store.job.completionProofData, undefined);
 });
 
 test("Authenticated image fetch refuses outsiders and serves the real image type", async () => {
@@ -265,7 +298,7 @@ test("Authenticated image fetch refuses outsiders and serves the real image type
 
 test.after(() => { try { fs.unlinkSync(proofPath); } catch {} });
 
-test("Worker can replace a submitted photo before Hirer confirmation; old bytes are retired only after commit", async () => {
+test("Worker can replace a submitted photo; shared bytes commit before the old local file is retired", async () => {
   seed("awaiting_confirmation", true);
   const replaceHandler = controller.replaceCompletionProof[1];
   const firstPath = proofPath;
@@ -278,11 +311,12 @@ test("Worker can replace a submitted photo before Hirer confirmation; old bytes 
   assert.match(store.job.completionProofUrl, /^\/uploads\/job-proofs\/job-1-[\w-]+\.png$/);
   assert.equal(fs.existsSync(firstPath), false);
   const newPath = path.join(path.dirname(firstPath), path.basename(store.job.completionProofUrl));
-  assert.equal(fs.readFileSync(newPath).equals(png), true);
+  assert.equal(fs.existsSync(newPath), false);
+  assert.equal(store.job.completionProofStorage, "mongodb");
+  assert.deepEqual(store.job.completionProofData, png);
   assert.equal(store.logs[0].note, "Worker replaced completion proof");
   assert.equal(store.notifications.length, 1);
   assert.equal((await call(controller.getCompletionProof, reqFor("worker-1"))).statusCode, 200);
-  fs.unlinkSync(newPath);
 });
 
 test("Proof replacement is forbidden after completion, for non-participants, or for invalid photo data", async () => {

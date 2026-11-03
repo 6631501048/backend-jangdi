@@ -109,6 +109,9 @@ const getMockPayment = asyncHandler(async (req, res) => {
   res.json({ jobId: payment.job, status: payment.status, paymentMode: payment.paymentMode || "demo",
     amount: payment.amount, platformFeeAmount: payment.platformFeeAmount,
     totalDue: Math.round((payment.amount + payment.platformFeeAmount) * 100) / 100,
+    disputeReason: payment.disputeReason, refundDecision: payment.refundDecision,
+    refundNotes: payment.refundNotes, refundStatus: payment.refundStatus,
+    refundAmount: payment.refundAmount,
     heldAt: payment.heldAt, releasedAt: payment.releasedAt });
 });
 

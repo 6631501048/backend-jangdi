@@ -15,6 +15,7 @@ if (process.env.TRUST_PROXY) {
 }
 
 app.use(cors({ origin: process.env.CLIENT_URL || "*" }));
+app.post('/api/payments/stripe/webhook', express.raw({type:'application/json'}), require('./controllers/stripe.controller').webhook);
 app.use(express.json());
 app.use(morgan("dev"));
 

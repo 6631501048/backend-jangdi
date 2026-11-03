@@ -16,7 +16,7 @@ const paymentSchema = new mongoose.Schema(
     netAmountToWorker: { type: Number, required: true },
 
     // MVP simulation is never an actual transfer. Manual real-money flow comes after MVP.
-    paymentMode: { type: String, enum: ["demo", "manual"], default: "demo" },
+    paymentMode: { type: String, enum: ["demo", "manual", "stripe_test"], default: "demo" },
 
     // FR-PAY-02: Pending -> Held -> Released, ทางเลือก Refunded, และ disputed ระหว่างทาง
     status: {
@@ -32,6 +32,17 @@ const paymentSchema = new mongoose.Schema(
     heldAt: { type: Date, default: null },
     releasedAt: { type: Date, default: null },
 
+    stripeSessionId: { type: String, default: null, index: true },
+    stripePaymentIntentId: { type: String, default: null },
+    gatewayFeeAmount: { type: Number, default: null },
+    stripeRefundId: { type: String, default: null },
+    refundStatus: { type: String, default: null },
+    refundAmount: { type: Number, default: null },
+    refundedAt: { type: Date, default: null },
+    refundNotes: { type: String, default: null },
+    refundPreviousJobStatus: { type: String, default: null },
+    refundEvidenceCount: { type: Number, default: 0 },
+    refundEvidence: { type: [{ data: Buffer, contentType: String }], default: [], select: false },
     // FR-PAY-06
     disputeRaisedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     disputeReason: { type: String, default: null },

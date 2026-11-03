@@ -4,6 +4,7 @@ const path = require("path");
 const fs = require("fs");
 const { randomUUID } = require("crypto");
 const { detectProofImage } = require("../utils/proofImage");
+const { readCompletionProof } = require("../services/jobProof.service");
 const { Job, JobWaiting, Payment, JobLog, ServiceRequest, ServicePost } = require("../models");
 const { checkContent } = require("../utils/contentFilter");
 const { logJobStatusChange } = require("../services/jobLog.service");
@@ -389,6 +390,7 @@ const getMyWorkerJobs = asyncHandler(async (req, res) => {
 
   const statusMap = {
     "in-progress": ["assigned", "in_progress", "awaiting_confirmation"],
+    disputed: ["disputed"],
     completed: ["completed"],
   };
   const jobStatuses = statusMap[status];
@@ -414,8 +416,7 @@ const getMyWorkerJobs = asyncHandler(async (req, res) => {
 const PROOF_DIR = path.resolve(process.env.JOB_PROOF_DIR || path.join(__dirname, "..", "..", "uploads", "job-proofs"));
 fs.mkdirSync(PROOF_DIR, { recursive: true });
 
-// Keep an untrusted upload in memory until ownership, state and the image signature
-// have been checked. Nothing is written to disk for invalid / unauthorized requests.
+// Validate before committing image bytes and the job state in the same transaction.
 const proofUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 1 },
@@ -451,7 +452,7 @@ const updateJobStatus = [
     if (next === "in_progress") {
       // No Worker can start until the Hirer has explicitly completed mock payment.
       const paid = await Payment.exists({ job: job._id, worker: req.user._id, status: "held",
-        $or: [{ paymentMode: "demo" }, { paymentMode: { $exists: false } }] });
+        $or: [{ paymentMode: { $in: ["demo", "stripe_test"] } }, { paymentMode: { $exists: false } }] });
       if (!paid) return res.status(409).json({ message: "รอ Hirer กดยืนยันการชำระเงินจำลองก่อนเริ่มงาน" });
     }
     if (next === "in_progress" && req.file) {
@@ -459,7 +460,6 @@ const updateJobStatus = [
     }
 
     const fields = { status: next };
-    let savedImagePath = null;
     if (next === "awaiting_confirmation") {
       if (!req.file) return res.status(400).json({ message: "Attach a completion photo before submitting the job." });
       const kind = detectProofImage(req.file.buffer);
@@ -467,9 +467,9 @@ const updateJobStatus = [
         return res.status(400).json({ message: "The image content does not match a supported JPG, PNG, or WebP file." });
       }
       const filename = `${job._id}-${randomUUID()}${kind.ext}`;
-      savedImagePath = path.join(PROOF_DIR, filename);
-      await fs.promises.writeFile(savedImagePath, req.file.buffer, { flag: "wx" });
       fields.completionProofUrl = `/uploads/job-proofs/${filename}`;
+      fields.completionProofStorage = "mongodb";
+      fields.completionProofData = req.file.buffer;
       fields.proofSubmittedAt = new Date();
     }
 
@@ -502,7 +502,6 @@ const updateJobStatus = [
         }, session);
       });
     } catch (err) {
-      if (savedImagePath) await fs.promises.unlink(savedImagePath).catch(() => {});
       if (err.code === "JOB_STATUS_CONFLICT") {
         return res.status(409).json({ message: "Job status changed. Refresh and try again." });
       }
@@ -535,12 +534,10 @@ const replaceCompletionProof = [
     if (!kind || kind.mime !== req.file.mimetype) {
       return res.status(400).json({ message: "ไฟล์ต้องเป็นรูป JPG, PNG หรือ WebP ที่ถูกต้อง" });
     }
-    // Write the new image first; the old image must remain readable until the
-    // Job update commits. The CAS also races safely with Hirer confirmation.
+    // Image bytes and their new version commit together in the existing database.
+    // The CAS also races safely with Hirer confirmation.
     const newFilename = `${job._id}-${randomUUID()}${kind.ext}`;
-    const newPath = path.join(PROOF_DIR, newFilename);
     const newProofUrl = `/uploads/job-proofs/${newFilename}`;
-    await fs.promises.writeFile(newPath, req.file.buffer, { flag: "wx" });
     let updated;
     let notification;
     try {
@@ -551,7 +548,7 @@ const replaceCompletionProof = [
             status: "awaiting_confirmation", completionConfirmedAt: null,
             completionProofUrl: job.completionProofUrl,
           },
-          { $set: { completionProofUrl: newProofUrl, proofSubmittedAt: new Date() } },
+          { $set: { completionProofUrl: newProofUrl, completionProofStorage: "mongodb", completionProofData: req.file.buffer, proofSubmittedAt: new Date() } },
           { new: true, runValidators: true, session }
         );
         if (!updated) {
@@ -573,7 +570,6 @@ const replaceCompletionProof = [
         }, session);
       });
     } catch (err) {
-      await fs.promises.unlink(newPath).catch(() => {});
       if (err.code === "JOB_PROOF_CONFLICT") {
         return res.status(409).json({ message: "Job has changed or Hirer confirmed it. Refresh and try again." });
       }
@@ -599,17 +595,11 @@ const getCompletionProof = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: "ไม่มีสิทธิ์ดูหลักฐานของงานนี้" });
   }
 
-  // Resolve only stored paths belonging to our private proof directory. Never accept
-  // filename/path input from the request (prevents path traversal).
-  const match = /^\/uploads\/job-proofs\/([a-zA-Z0-9_.-]+)$/.exec(job.completionProofUrl || "");
-  if (!match || match[1] === "." || match[1] === "..") {
-    return res.status(404).json({ message: "ยังไม่มีหลักฐานของงานนี้" });
-  }
   let content;
   try {
-    content = await fs.promises.readFile(path.join(PROOF_DIR, match[1]));
+    content = await readCompletionProof(job);
   } catch (err) {
-    if (err.code === "ENOENT") return res.status(404).json({ message: "ไม่พบไฟล์หลักฐาน" });
+    if (err.statusCode) return res.status(err.statusCode).json({ message: err.message });
     throw err;
   }
   const image = detectProofImage(content);
@@ -635,16 +625,12 @@ const confirmCompletion = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: "No completion photo is attached to this job." });
   }
 
-  const proofMatch = /^\/uploads\/job-proofs\/([a-zA-Z0-9_.-]+)$/.exec(job.completionProofUrl);
-  if (!proofMatch || proofMatch[1] === "." || proofMatch[1] === "..") {
-    return res.status(400).json({ message: "Completion proof path is invalid. Ask the Worker to submit the photo again." });
-  }
   let proofBytes;
   try {
-    proofBytes = await fs.promises.readFile(path.join(PROOF_DIR, proofMatch[1]));
+    proofBytes = await readCompletionProof(job);
   } catch (err) {
-    if (err.code === "ENOENT") {
-      return res.status(409).json({ message: "Completion photo is missing from storage. Ask the Worker to submit the photo again." });
+    if (err.statusCode) {
+      return res.status(409).json({ message: err.message });
     }
     throw err;
   }

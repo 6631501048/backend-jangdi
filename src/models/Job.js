@@ -62,6 +62,10 @@ const jobSchema = new mongoose.Schema(
 
     // FR-TRACK-03: หลักฐานรูปภาพเมื่องานเสร็จ
     completionProofUrl: { type: String, default: null },
+    // Shared proof bytes live in the existing database, not a developer's uploads folder.
+    // Exclude the binary from job lists and ordinary detail responses.
+    completionProofStorage: { type: String, enum: ["local", "mongodb"], default: "local" },
+    completionProofData: { type: Buffer, select: false },
     proofSubmittedAt: { type: Date, default: null },
     // Hirer confirmation is persisted; frontend component state must never be the source of truth.
     completionConfirmedAt: { type: Date, default: null },
@@ -77,7 +81,15 @@ const jobSchema = new mongoose.Schema(
     cancelledAt: { type: Date, default: null },
     cancelReason: { type: String, default: null },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: {
+      transform(doc, result) {
+        delete result.completionProofData;
+        return result;
+      },
+    },
+  }
 );
 
 jobSchema.index({ location: "2dsphere" });
