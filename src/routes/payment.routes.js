@@ -3,10 +3,11 @@ const { protect, requireRole } = require("../middleware/auth.middleware");
 const { getWallet, getSummary, getTransactions, getMockPayment, confirmMockPayment, uploadSlip, raiseDispute } = require("../controllers/payment.controller");
 
 const {getOverview} = require('../controllers/finance.controller');
-const {createCheckout} = require('../controllers/stripe.controller');
+const {createCheckout,getStripeStatus} = require('../controllers/stripe.controller');
 const {requestRefund,getEvidence} = require('../controllers/refund.controller');
 const slips = require('../controllers/slipPayment.controller');
 router.get('/config', protect, slips.getConfig);
+router.get('/stripe/status', protect, getStripeStatus);
 router.post('/:jobId/slips/inbound', protect, requireRole('hirer'), ...slips.submitInbound);
 router.get('/:id/slips/:direction', protect, slips.getSlip);
 router.get('/overview', protect, getOverview);

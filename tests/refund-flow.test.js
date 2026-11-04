@@ -18,7 +18,7 @@ stub('../src/services/transaction.service',{withTransaction:async work=>{
   const oldPayment=structuredClone(payment),oldJob=structuredClone(job);
   try{return await work({});}catch(err){payment=oldPayment;job=oldJob;throw err;}
 }});
-stub('../src/services/stripe.service',{request:async (endpoint,options)=>{stripeCalls.push({endpoint,options});return {id:'re_test',status:stripeStatus};}});
+stub('../src/services/stripe.service',{verify:body=>body,request:async (endpoint,options)=>{stripeCalls.push({endpoint,options});return {id:'re_test',status:stripeStatus,livemode:false,currency:'thb',amount:10500,payment_intent:'pi_test',metadata:{paymentId:id}};}});
 const controller=require('../src/controllers/refund.controller');
 function reset(mode='demo') {
   payment={_id:id,job:'job1',hirer:'hirer1',worker:'worker1',status:'held',paymentMode:mode,amount:100,platformFeeAmount:5,refundDecision:null,stripePaymentIntentId:'pi_test'};
@@ -60,7 +60,41 @@ test('Stripe pending refund does not claim money returned; retries reuse idempot
   assert.equal(payment.status,'disputed');assert.equal(job.status,'disputed');assert.equal(payment.refundStatus,'pending');
   await assert.rejects(invoke(controller.decideRefund,decision('rejected')));
   stripeStatus='succeeded';await invoke(controller.decideRefund,decision('approved'));
-  assert.equal(payment.status,'refunded');assert.equal(stripeCalls[0].options.params.amount,10500);assert.equal(stripeCalls[0].options.key,stripeCalls[1].options.key);
+  assert.equal(payment.status,'refunded');assert.equal(stripeCalls[0].options.params.amount,10500);assert.equal(stripeCalls[1].endpoint,'refunds/re_test');assert.equal(stripeCalls.filter(c=>c.endpoint==='refunds').length,1);
+});
+
+test('Stripe refund response validates currency, amount, owner, intent and test mode',async()=>{
+  const valid={id:'re_test',status:'succeeded',livemode:false,currency:'thb',amount:10500,payment_intent:'pi_test',metadata:{paymentId:id}};
+  for (const wrong of [{currency:'usd'},{amount:10000},{payment_intent:'pi_other'},{metadata:{paymentId:'other'}},{livemode:true},{id:null}]) {
+    reset('stripe_test');await submit();payment.refundDecision='approved';
+    await assert.rejects(controller.recordStripeRefund({...payment},{...valid,...wrong}),err=>err.statusCode===502);
+    assert.equal(payment.status,'disputed');assert.equal(job.status,'disputed');
+  }
+});
+
+test('late pending response cannot regress a successful refund or reopen a job',async()=>{
+  reset('stripe_test');await submit();await invoke(controller.decideRefund,decision('approved'));
+  const old={...payment,status:'disputed'};
+  await controller.recordStripeRefund(old,{id:'re_test',status:'pending',livemode:false,currency:'thb',amount:10500,payment_intent:'pi_test',metadata:{paymentId:id}});
+  assert.equal(payment.status,'refunded');assert.equal(payment.refundStatus,'succeeded');assert.equal(job.status,'cancelled');
+});
+
+test('failed Stripe refund remains disputed and retry reads existing refund without charging again',async()=>{
+  reset('stripe_test');await submit();stripeStatus='failed';
+  await assert.rejects(invoke(controller.decideRefund,decision('approved')),err=>err.statusCode===409);
+  assert.equal(payment.status,'disputed');assert.equal(payment.refundStatus,'failed');
+  await assert.rejects(invoke(controller.decideRefund,decision('approved')));
+  assert.equal(stripeCalls.filter(c=>c.endpoint==='refunds').length,1);
+});
+
+test('out-of-order refund webhook uses the latest Stripe result and completes only once',async()=>{
+  reset('stripe_test');await submit();stripeStatus='pending';await invoke(controller.decideRefund,decision('approved'));
+  const webhook=require('../src/controllers/stripe.controller').webhook;
+  stripeStatus='succeeded';
+  const req={headers:{},body:{livemode:false,type:'refund.updated',data:{object:{id:'re_test',payment_intent:'pi_test',status:'pending'}}}};
+  await invoke(webhook,req);assert.equal(payment.status,'refunded');assert.equal(job.status,'cancelled');
+  assert.equal(stripeCalls.at(-1).endpoint,'refunds/re_test');
+  const count=stripeCalls.length;await invoke(webhook,req);assert.equal(stripeCalls.length,count);assert.equal(payment.refundStatus,'succeeded');
 });
 test('evidence is private to participants and admin',async()=>{
   reset();payment.refundEvidence=[{data:Buffer.from('private-image'),contentType:'image/png'}];

@@ -6,16 +6,16 @@ function stub(relative,exports) { const filename=require.resolve(relative);requi
 stub('../src/models',{
   Job:{findById:async()=>job},
   Payment:{
-    findOneAndUpdate:async (query,change)=>{if(payment.status!==query.status || String(query.hirer)!==String(payment.hirer))return null;Object.assign(payment,change.$set);return {...payment};},
-    findOne:async query=>query.stripeSessionId===payment.stripeSessionId && query.paymentMode===payment.paymentMode ? {...payment}:null,
-    updateOne:async(query,change)=>{if(query.status && payment.status!==query.status)return;if(change.$set.status==='held')heldUpdates++;Object.assign(payment,change.$set);},
+    findOneAndUpdate:async (query,change)=>{if(payment.status!==query.status || String(query.hirer)!==String(payment.hirer) || query.worker!==payment.worker)return null;Object.assign(payment,change.$set);return {...payment};},
+    findOne:async query=>Object.entries(query).every(([key,value])=>(payment[key]??null)===(value??null)) ? {...payment}:null,
+    updateOne:async(query,change)=>{if(!Object.entries(query).every(([key,value])=>(payment[key]??null)===(value??null)))return;if(change.$set.status==='held')heldUpdates++;Object.assign(payment,change.$set);},
   },
 });
 const controller=require('../src/controllers/stripe.controller');
 function reset(){
   process.env.STRIPE_SECRET_KEY='sk_test_example';process.env.STRIPE_WEBHOOK_SECRET='secret';process.env.CLIENT_URL='http://localhost:5173';
-  payment={_id:'pay1',job:'job1',hirer:'hirer1',status:'pending',paymentMode:'demo',amount:100,platformFeeAmount:5};
-  job={_id:'job1',hirer:'hirer1',status:'assigned',title:'งานทดสอบ'};apiCalls=[];heldUpdates=0;
+  payment={_id:'pay1',job:'job1',hirer:'hirer1',worker:'worker1',status:'pending',paymentMode:'demo',amount:100,platformFeeAmount:5};
+  job={_id:'job1',hirer:'hirer1',selectedWorker:'worker1',status:'assigned',title:'งานทดสอบ'};apiCalls=[];heldUpdates=0;
   global.fetch=async(url,options)=>{
     apiCalls.push({url,options});
     const data=url.includes('payment_intents') ? {latest_charge:{balance_transaction:{currency:'thb',fee:400}}} : {id:'cs_test_1',status:'open',url:'https://checkout.stripe.com/test'};
@@ -55,4 +55,46 @@ test('valid paid webhook records gateway cost and repeated delivery releases no 
 });
 test('unpaid Checkout completion never marks a payment as held',async()=>{
   reset();payment.paymentMode='stripe_test';payment.stripeSessionId='cs_test_1';await invoke(controller.webhook,event({payment_status:'unpaid'}));assert.equal(payment.status,'pending');
+});
+
+test('checkout reuses an open session after browser cancellation without a second charge',async()=>{
+  reset();await invoke(controller.createCheckout,request());await invoke(controller.createCheckout,request());
+  assert.equal(apiCalls.filter(c=>c.options.method==='POST').length,1);assert.equal(payment.status,'pending');
+});
+
+test('expired session creates a replacement and complete session waits for webhook',async()=>{
+  for(const status of ['expired','complete']){
+    reset();payment.paymentMode='stripe_test';payment.stripeSessionId='cs_old';
+    global.fetch=async(url,options)=>{apiCalls.push({url,options});return {ok:true,json:async()=>options.method==='GET'?{id:'cs_old',status}:{id:'cs_new',url:'https://checkout.stripe.com/new'}};};
+    const result=await invoke(controller.createCheckout,request());
+    assert.equal(result.status,status==='complete'?409:200);assert.equal(payment.status,'pending');
+    assert.equal(apiCalls.filter(c=>c.options.method==='POST').length,status==='complete'?0:1);
+  }
+});
+
+test('checkout refuses wrong job state or a payment for a different selected worker',async()=>{
+  reset();job.status='completed';assert.equal((await invoke(controller.createCheckout,request())).status,409);
+  reset();job.selectedWorker='worker2';assert.equal((await invoke(controller.createCheckout,request())).status,409);assert.equal(apiCalls.length,0);
+});
+
+test('checkout uses stored fee and rounds THB to satang at ten percent',async()=>{
+  reset();payment.amount=123.45;payment.platformFeeAmount=12.35;await invoke(controller.createCheckout,request());
+  assert.equal(new URLSearchParams(apiCalls[0].options.body).get('line_items[0][price_data][unit_amount]'),'13580');
+});
+
+test('late duplicate success is acknowledged without contacting Stripe again',async()=>{
+  reset();payment.paymentMode='stripe_test';payment.stripeSessionId='cs_test_1';await invoke(controller.webhook,event());apiCalls=[];
+  assert.equal((await invoke(controller.webhook,event())).status,200);assert.equal(apiCalls.length,0);assert.equal(heldUpdates,1);
+});
+
+test('payment webhook rejects wrong owner reference or currency and ignores unrelated sessions',async()=>{
+  reset();payment.paymentMode='stripe_test';payment.stripeSessionId='cs_test_1';
+  for(const wrong of [{client_reference_id:'other'},{currency:'usd'}])assert.equal((await invoke(controller.webhook,event(wrong))).status,400);
+  assert.equal((await invoke(controller.webhook,event({id:'cs_unrelated'}))).status,200);assert.equal(payment.status,'pending');
+});
+
+test('readiness response contains only booleans and never credentials',async()=>{
+  reset();const result=await invoke(controller.getStripeStatus,{});
+  assert.deepEqual(result.body,{ready:true,testKeyConfigured:true,webhookConfigured:true});
+  delete process.env.STRIPE_WEBHOOK_SECRET;assert.equal((await invoke(controller.getStripeStatus,{})).body.ready,false);
 });

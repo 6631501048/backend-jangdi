@@ -60,6 +60,18 @@ async function completeRefund(paymentId, refund, existingSession) {
   if (existingSession) return work(existingSession);
   return withTransaction(work);
 }
+async function recordStripeRefund(payment, refund) {
+  if (!refund || refund.livemode !== false || refund.currency !== 'thb' ||
+      refund.payment_intent !== payment.stripePaymentIntentId ||
+      refund.amount !== Math.round(paidTotal(payment)*100) ||
+      refund.metadata?.paymentId !== String(payment._id) ||
+      !refund.id || (payment.stripeRefundId && payment.stripeRefundId !== refund.id)) {
+    throw error('ผลคืนเงิน Stripe ไม่ตรงกับรายการ กรุณาตรวจสอบก่อนดำเนินการ',502);
+  }
+  // A delayed API response must never replace a completed refund with pending/failed.
+  await Payment.updateOne({_id:payment._id,paymentMode:'stripe_test',status:'disputed',refundDecision:'approved'},{$set:{stripeRefundId:refund.id,refundStatus:refund.status}});
+  if (refund.status === 'succeeded') await completeRefund(payment._id,refund);
+}
 const decideRefund = asyncHandler(async (req,res) => {
   const {decision,notes} = req.body;
   if (!mongoose.isValidObjectId(req.params.id) || !['approved','rejected'].includes(decision) || typeof notes !== 'string' || notes.trim().length < 10 || notes.trim().length > 1000) return res.status(400).json({message:'กรุณาระบุผลการพิจารณาและเหตุผล 10–1000 ตัวอักษร'});
@@ -88,12 +100,17 @@ const decideRefund = asyncHandler(async (req,res) => {
     const amount = paidTotal(payment);
     await Payment.updateOne({_id:payment._id},{$set:{refundAmount:amount}});
     if (payment.paymentMode === 'stripe_test') {
-      const refund = await stripe.request('refunds',{method:'POST',key:`refund-${payment._id}`,params:{payment_intent:payment.stripePaymentIntentId,amount:Math.round(amount*100),'metadata[paymentId]':String(payment._id)}});
-      await Payment.updateOne({_id:payment._id},{$set:{stripeRefundId:refund.id,refundStatus:refund.status}});
-      if (refund.status === 'succeeded') await completeRefund(payment._id,refund);
+      if (!payment.stripePaymentIntentId) throw error('ไม่พบรายการชำระ Stripe สำหรับคืนเงิน');
+      // Once a refund exists, retrieve it instead of POSTing again after key expiry.
+      const refund = payment.stripeRefundId
+        ? await stripe.request(`refunds/${payment.stripeRefundId}`)
+        : await stripe.request('refunds',{method:'POST',key:`refund-${payment._id}`,params:{payment_intent:payment.stripePaymentIntentId,amount:Math.round(amount*100),'metadata[paymentId]':String(payment._id)}});
+      await recordStripeRefund(payment,refund);
+      if (['failed','canceled'].includes(refund.status)) throw error('Stripe คืนเงินไม่สำเร็จ กรุณาตรวจสอบรายการใน Stripe ก่อนดำเนินการต่อ');
+      return res.json({message:refund.status === 'succeeded' ? 'Stripe ยืนยันคืนเงินเต็มจำนวนแล้ว' : 'อนุมัติแล้ว กำลังรอ Stripe ยืนยันการคืนเงิน'});
     } else if ((payment.paymentMode || 'demo') === 'demo') await completeRefund(payment._id);
     else throw error('รายการโอนเงินจริงต้องดำเนินการคืนเงินด้วยตนเอง');
   }
   res.json({message:decision === 'approved' ? 'บันทึกอนุมัติคืนเงินเต็มจำนวนรวมค่าบริการแล้ว':'ปฏิเสธคำขอและคืนงานสู่ขั้นตอนเดิมแล้ว'});
 });
-module.exports = {requestRefund,getEvidence,decideRefund,completeRefund};
+module.exports = {requestRefund,getEvidence,decideRefund,completeRefund,recordStripeRefund};
