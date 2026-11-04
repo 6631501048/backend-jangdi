@@ -41,6 +41,10 @@ const paymentSchema = new mongoose.Schema(
     hasInboundSlip: { type: Boolean, default: false },
     hasPayoutSlip: { type: Boolean, default: false },
     hasRefundSlip: { type: Boolean, default: false },
+    inboundSlipHash: { type: String, default: null },
+    payoutSlipHash: { type: String, default: null },
+    payoutAmount: { type: Number, default: null },
+    payoutReference: { type: String, default: null },
     slipEvidence: { type: { inbound: Buffer, payout: Buffer, refund: Buffer }, select: false },
     slipAudit: [{ action: String, by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, at: Date, notes: String, version: String }],
 
@@ -66,5 +70,6 @@ const paymentSchema = new mongoose.Schema(
   },
   { timestamps: true, toJSON: { transform(doc, value) { delete value.slipEvidence; delete value.refundEvidence; return value; } } }
 );
-
+paymentSchema.index({ inboundSlipHash: 1 }, { unique: true, partialFilterExpression: { inboundSlipHash: { $type: "string" } } });
+paymentSchema.index({ payoutSlipHash: 1 }, { unique: true, partialFilterExpression: { payoutSlipHash: { $type: "string" } } });
 module.exports = mongoose.model("Payment", paymentSchema);

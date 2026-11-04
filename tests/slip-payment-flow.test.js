@@ -57,9 +57,14 @@ app.post('/admin/payments/:id/slip-review',protect,adminOnly,slips.reviewInbound
 app.post('/admin/payments/:id/slips/:direction',protect,adminOnly,...slips.submitOutbound);
 app.post('/admin/payments/:id/refund-decision',protect,adminOnly,refund.decideRefund);
 app.use((error,req,res,next)=>res.status(error.statusCode || 500).json({message:error.message}));
+const fourEyes=process.env.REQUIRE_FOUR_EYES;
 let server,base;
 test.before(async()=>{process.env.JWT_SECRET='slip-tests-only';server=app.listen(0,'127.0.0.1');await once(server,'listening');base=`http://127.0.0.1:${server.address().port}`;});
 test.after(()=>new Promise(resolve=>server.close(resolve)));
+test('four-eyes blocks the reviewer from paying themselves when enabled',async()=>{
+  reset();await inbound();await review();store.job.status='awaiting_confirmation';store.payment.status='payout_pending';process.env.REQUIRE_FOUR_EYES='1';
+  try{assert.equal((await payout()).status,403);}finally{if(fourEyes===undefined)delete process.env.REQUIRE_FOUR_EYES;else process.env.REQUIRE_FOUR_EYES=fourEyes;}
+});
 function reset(){store={job:{_id:ids.job,hirer:ids.hirer,selectedWorker:ids.worker,status:'assigned',title:'งานทดสอบ',completionProofUrl:'/uploads/job-proofs/shared.png',completionProofStorage:'mongodb',completionProofData:png},payment:{_id:ids.payment,job:ids.job,hirer:ids.hirer,worker:ids.worker,status:'pending',paymentMode:'slip_demo',amount:100,platformFeeAmount:5,platformFeePercent:5,netAmountToWorker:100,stripeSessionId:null,refundDecision:null}};}
 async function request(path,{role='hirer',method='POST',body}={}){
   const headers={};if(role)headers.Authorization=`Bearer ${jwt.sign({id:ids[role]},process.env.JWT_SECRET)}`;
@@ -69,7 +74,7 @@ async function request(path,{role='hirer',method='POST',body}={}){
 function form(bytes=png,notes){const body=new FormData();body.append('slip',new Blob([bytes],{type:'image/png'}),'slip.png');if(notes)body.append('notes',notes);return body;}
 const inbound=()=>request(`/payments/${ids.job}/slips/inbound`,{body:form()});
 const review=(decision='approved',version=store.payment.inboundSlipVersion)=>request(`/admin/payments/${ids.payment}/slip-review`,{role:'admin',body:{decision,version,notes:'ตรวจสอบรูปและยอดชำระแล้ว'}});
-const payout=()=>request(`/admin/payments/${ids.payment}/slips/payout`,{role:'admin',body:form(png,'ตรวจยอดและจ่ายค่าจ้างจำลองแล้ว')});
+const payout=(bytes=png,extra={})=>{const body=form(bytes,'ตรวจยอดและจ่ายค่าจ้างจำลองแล้ว');body.append('amount','100');body.append('reference','TH202602000001');return request(`/admin/payments/${ids.payment}/slips/payout`,{role:'admin',body,...extra});};
 async function completeJob(){store.job.status='awaiting_confirmation';return request(`/jobs/${ids.job}/confirm`,{body:{}});}
 test('anonymous, worker and outsiders cannot submit a hirer slip; ordinary users cannot approve',async()=>{
   reset();for(const role of [null,'worker','other']){const result=await request(`/payments/${ids.job}/slips/inbound`,{role,body:form()});assert.ok([401,403,409].includes(result.status));}

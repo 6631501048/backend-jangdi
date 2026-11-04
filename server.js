@@ -1,4 +1,10 @@
 require("dotenv").config();
+
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  console.error("JWT_SECRET ต้องยาวอย่างน้อย 32 ตัวอักษร");
+  process.exit(1);
+}
+
 const http = require("http");
 const { Server } = require("socket.io");
 const connectDB = require("./src/config/db");
@@ -12,7 +18,7 @@ const server = http.createServer(app);
 
 // FR-NOTIF-01 / §5.4: real-time notification channel (WebSocket)
 const io = new Server(server, {
-  cors: { origin: process.env.CLIENT_URL || "*" },
+  cors: { origin: process.env.CLIENT_URL || "http://localhost:5173" },
 });
 
 io.on("connection", (socket) => {

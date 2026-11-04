@@ -1,6 +1,7 @@
 const asyncHandler = require("express-async-handler");
 const multer = require("multer");
 const path = require("path");
+const mongoose = require("mongoose");
 const fs = require("fs");
 const { randomUUID } = require("crypto");
 const { detectProofImage } = require("../utils/proofImage");
@@ -121,11 +122,34 @@ const getJobTimeline = asyncHandler(async (req, res) => {
   })));
 });
 
-/** GET /api/jobs/:id — FR-BROWSE-03 (ดูรายละเอียดงาน) */
+// ฟิลด์ที่คนนอกเห็นได้ (ตรงกับที่หน้า browse ใช้จริง)
+// ไม่รวม: location, selectedWorker, rejectionReason, cancelReason, approvedBy/At,
+// completionProof*, originServiceRequest
+const PUBLIC_JOB_FIELDS = [
+  "_id", "category", "title", "description", "locationText", "fromText", "toText",
+  "deliveryFee", "notes", "price", "scheduledAt", "durationStart", "durationEnd",
+  "status", "createdAt", "hirer",
+];
+const pickPublicJob = (job) => {
+  const plain = typeof job.toJSON === "function" ? job.toJSON() : job;
+  return Object.fromEntries(PUBLIC_JOB_FIELDS.filter((key) => key in plain).map((key) => [key, plain[key]]));
+};
+
 const getJobById = asyncHandler(async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: "ไม่พบประกาศงานนี้" });
   const job = await Job.findById(req.params.id).populate("hirer", "fullName avatarUrl credibilityScore");
   if (!job) return res.status(404).json({ message: "ไม่พบประกาศงานนี้" });
-  res.json(job);
+
+  const userId = String(req.user._id);
+  const hirerId = String(job.hirer?._id ?? job.hirer);
+  const isParticipant = req.user.isAdmin || userId === hirerId ||
+    (job.selectedWorker && userId === String(job.selectedWorker));
+  if (isParticipant) return res.json(job);
+
+  let visible = job.status === "waiting";
+  if (!visible) visible = Boolean(await JobWaiting.exists({ job: job._id, worker: req.user._id }));
+  if (!visible) return res.status(404).json({ message: "ไม่พบประกาศงานนี้" });
+  res.json(pickPublicJob(job));
 });
 
 /**
@@ -192,6 +216,7 @@ const getFeed = asyncHandler(async (req, res) => {
   }
 
   const jobs = await Job.find(query)
+    .select(PUBLIC_JOB_FIELDS.join(" "))
     .populate("hirer", "fullName avatarUrl credibilityScore")
     .sort({ createdAt: -1 });
   res.json(jobs);

@@ -14,7 +14,10 @@ if (process.env.TRUST_PROXY) {
   app.set("trust proxy", Number.isNaN(n) ? process.env.TRUST_PROXY : n);
 }
 
-app.use(cors({ origin: process.env.CLIENT_URL || "*" }));
+if (!process.env.CLIENT_URL && process.env.NODE_ENV === "production") {
+  throw new Error("CLIENT_URL is required in production");
+}
+app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173" }));
 app.post('/api/payments/stripe/webhook', express.raw({type:'application/json'}), require('./controllers/stripe.controller').webhook);
 app.use(express.json());
 app.use(morgan("dev"));
