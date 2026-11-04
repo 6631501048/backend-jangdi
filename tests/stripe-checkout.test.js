@@ -18,7 +18,7 @@ function reset(){
   job={_id:'job1',hirer:'hirer1',selectedWorker:'worker1',status:'assigned',title:'งานทดสอบ'};apiCalls=[];heldUpdates=0;
   global.fetch=async(url,options)=>{
     apiCalls.push({url,options});
-    const data=url.includes('payment_intents') ? {latest_charge:{balance_transaction:{currency:'thb',fee:400}}} : {id:'cs_test_1',status:'open',url:'https://checkout.stripe.com/test'};
+    const data=url.includes('payment_intents') ? {latest_charge:{balance_transaction:{currency:'thb',fee:400}}} : {id:'cs_test_1',status:'open',payment_method_types:['card','promptpay'],url:'https://checkout.stripe.com/test'};
     return {ok:true,json:async()=>data};
   };
 }
@@ -27,8 +27,8 @@ function invoke(handler,req){return new Promise((resolve,reject)=>{
   handler(req,res,err=>err ? reject(err):resolve({next:true}));
 });}
 const request=()=>({user:{_id:'hirer1'},params:{jobId:'job1'}});
-function event(overrides={}) {
-  const value={type:'checkout.session.completed',created:Math.floor(Date.now()/1000),livemode:false,data:{object:{id:'cs_test_1',client_reference_id:'pay1',payment_status:'paid',currency:'thb',amount_total:10500,payment_intent:'pi_test',...overrides}}};
+function event(overrides={},type='checkout.session.completed') {
+  const value={type,created:Math.floor(Date.now()/1000),livemode:false,data:{object:{id:'cs_test_1',client_reference_id:'pay1',payment_status:'paid',currency:'thb',amount_total:10500,payment_intent:'pi_test',...overrides}}};
   const body=Buffer.from(JSON.stringify(value)),timestamp=Math.floor(Date.now()/1000);
   const signature=crypto.createHmac('sha256','secret').update(`${timestamp}.`).update(body).digest('hex');
   return {body,headers:{'stripe-signature':`t=${timestamp},v1=${signature}`}};
@@ -42,6 +42,9 @@ test('checkout authorizes owner and charges server total only, without marking p
   assert.equal(payment.paymentMode,'stripe_test');assert.equal(payment.status,'pending');
   const form=new URLSearchParams(apiCalls[0].options.body);
   assert.equal(form.get('line_items[0][price_data][unit_amount]'),'10500');assert.equal(form.get('line_items[0][price_data][currency]'),'thb');assert.ok(apiCalls[0].options.headers['Idempotency-Key']);
+  assert.equal(form.get('allowed_payment_method_types[0]'),'card');assert.equal(form.has('payment_method_types[0]'),false);
+  assert.equal(form.get('allowed_payment_method_types[1]'),'promptpay');
+  assert.equal(apiCalls[0].options.headers['Idempotency-Key'],'checkout-v3-pay1-first');
 });
 test('webhook rejects forged signature and mismatched amount',async()=>{
   reset();payment.paymentMode='stripe_test';payment.stripeSessionId='cs_test_1';
@@ -97,4 +100,36 @@ test('readiness response contains only booleans and never credentials',async()=>
   reset();const result=await invoke(controller.getStripeStatus,{});
   assert.deepEqual(result.body,{ready:true,testKeyConfigured:true,webhookConfigured:true});
   delete process.env.STRIPE_WEBHOOK_SECRET;assert.equal((await invoke(controller.getStripeStatus,{})).body.ready,false);
+});
+
+test('old open card-only session is expired before a PromptPay-capable replacement is created',async()=>{
+  reset();payment.paymentMode='stripe_test';payment.stripeSessionId='cs_old';
+  global.fetch=async(url,options)=>{
+    apiCalls.push({url,options});
+    return {ok:true,json:async()=>options.method==='GET'?{id:'cs_old',status:'open',payment_method_types:['card']}:
+      url.endsWith('/expire')?{id:'cs_old',status:'expired'}:{id:'cs_new',status:'open',url:'https://checkout.stripe.com/new'}};
+  };
+  assert.equal((await invoke(controller.createCheckout,request())).status,200);
+  assert.equal(apiCalls[1].url,'https://api.stripe.com/v1/checkout/sessions/cs_old/expire');
+  assert.equal(apiCalls[2].url,'https://api.stripe.com/v1/checkout/sessions');
+  assert.equal(payment.stripeSessionId,'cs_new');assert.equal(payment.status,'pending');
+});
+
+test('if expiring the old session fails, no replacement is created or persisted',async()=>{
+  reset();payment.paymentMode='stripe_test';payment.stripeSessionId='cs_old';
+  global.fetch=async(url,options)=>{
+    apiCalls.push({url,options});
+    return {ok:options.method==='GET',status:400,json:async()=>options.method==='GET'?{id:'cs_old',status:'open',payment_method_types:['card']}:{error:{code:'resource_missing'}}};
+  };
+  await assert.rejects(invoke(controller.createCheckout,request()));assert.equal(apiCalls.length,2);assert.equal(payment.stripeSessionId,'cs_old');
+});
+
+test('QR generation, expiry and async failure never mark money as received',async()=>{
+  reset();payment.paymentMode='stripe_test';payment.stripeSessionId='cs_test_1';
+  for(const type of ['checkout.session.completed','checkout.session.expired','checkout.session.async_payment_failed']){
+    await invoke(controller.webhook,event({payment_status:'unpaid'},type));assert.equal(payment.status,'pending');
+  }
+  assert.equal(heldUpdates,0);
+  await invoke(controller.webhook,event({},'checkout.session.async_payment_succeeded'));assert.equal(payment.status,'held');
+  await invoke(controller.webhook,event({},'checkout.session.completed'));assert.equal(heldUpdates,1);
 });

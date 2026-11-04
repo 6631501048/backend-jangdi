@@ -18,12 +18,17 @@ const createCheckout = asyncHandler(async (req,res) => {
   let session;
   if (payment.stripeSessionId) {
     session = await stripe.request(`checkout/sessions/${payment.stripeSessionId}`);
-    if (session.status === 'open') return res.json({url:session.url});
+    if (session.status === 'open') {
+      const methods = session.payment_method_types || session.allowed_payment_method_types || [];
+      if (methods.includes('promptpay')) return res.json({url:session.url});
+      // Close the old card-only session before replacing it: never leave two payable sessions.
+      await stripe.request(`checkout/sessions/${session.id}/expire`,{method:'POST',key:`checkout-promptpay-expire-${session.id}`});
+    }
     if (session.status === 'complete') return res.status(409).json({message:'ชำระแล้ว กำลังรอ webhook ยืนยัน กรุณารีเฟรชภายหลัง'});
   }
   const base = new URL(process.env.CLIENT_URL || 'http://localhost:5173');
   const returnUrl = new URL(`/hirer/my-jobs/${job._id}/mock-payment`,base).href;
-  session = await stripe.request('checkout/sessions',{method:'POST',key:`checkout-${payment._id}-${payment.stripeSessionId || 'first'}`,params:{mode:'payment',locale:'th',success_url:`${returnUrl}?checkout=success`,cancel_url:`${returnUrl}?checkout=cancelled`,client_reference_id:String(payment._id),'metadata[paymentId]':String(payment._id),'line_items[0][price_data][currency]':'thb','line_items[0][price_data][unit_amount]':Math.round(paidTotal(payment)*100),'line_items[0][price_data][product_data][name]':job.title,'line_items[0][quantity]':1,'payment_method_types[0]':'card'}});
+  session = await stripe.request('checkout/sessions',{method:'POST',key:`checkout-v3-${payment._id}-${payment.stripeSessionId || 'first'}`,params:{mode:'payment',locale:'th',success_url:`${returnUrl}?checkout=success`,cancel_url:`${returnUrl}?checkout=cancelled`,client_reference_id:String(payment._id),'metadata[paymentId]':String(payment._id),'line_items[0][price_data][currency]':'thb','line_items[0][price_data][unit_amount]':Math.round(paidTotal(payment)*100),'line_items[0][price_data][product_data][name]':job.title,'line_items[0][quantity]':1,'allowed_payment_method_types[0]':'card','allowed_payment_method_types[1]':'promptpay'}});
   // A concurrent retry must not overwrite a newer Checkout session.
   await Payment.updateOne({_id:payment._id,status:'pending',paymentMode:'stripe_test',stripeSessionId:payment.stripeSessionId || null},{$set:{stripeSessionId:session.id}});
   res.json({url:session.url});
