@@ -107,7 +107,11 @@ const getMockPayment = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: "ไม่มีสิทธิ์ดูรายการชำระเงินนี้" });
   }
   res.json({ jobId: payment.job, status: payment.status, paymentMode: payment.paymentMode || "demo",
-    amount: payment.amount, platformFeeAmount: payment.platformFeeAmount,
+    id: payment._id, amount: payment.amount, platformFeeAmount: payment.platformFeeAmount,
+    platformFeePercent: payment.platformFeePercent, netAmountToWorker: payment.netAmountToWorker,
+    inboundSlipVersion: payment.inboundSlipVersion, slipReviewNotes: payment.slipReviewNotes,
+    hasInboundSlip: payment.hasInboundSlip, hasPayoutSlip: payment.hasPayoutSlip,
+    hasRefundSlip: payment.hasRefundSlip, paidAt: payment.paidAt, jobCompletedAt: payment.jobCompletedAt,
     totalDue: Math.round((payment.amount + payment.platformFeeAmount) * 100) / 100,
     disputeReason: payment.disputeReason, refundDecision: payment.refundDecision,
     refundNotes: payment.refundNotes, refundStatus: payment.refundStatus,

@@ -127,7 +127,7 @@ test('MVP-02 exact request details are private to the Service Post owner',async(
   assert.equal(response.status,200);
   assert.equal(response.data.orderData.itemBudget,50);
 });
-test('MVP-02 accepting a Service Request creates one linked Job and pending demo payment',async()=>{
+test('MVP-02 accepting a Service Request creates one linked Job and pending slip-demo payment',async()=>{
   reset();await create(baseOrder);
   const accept=()=>req('PATCH',`/api/service-posts/requests/${id.req}`,{user:id.worker,body:{action:'accept'}});
   assert.equal((await accept()).status,200);
@@ -137,7 +137,7 @@ test('MVP-02 accepting a Service Request creates one linked Job and pending demo
   assert.equal(db.jobs[0].toText,'Dorm F4');
   assert.equal(db.jobs[0].price,35);
   assert.equal(db.payments[0].status,'pending');
-  assert.equal(db.payments[0].paymentMode,'demo');
+  assert.equal(db.payments[0].paymentMode,'slip_demo');
   assert.equal(db.posts[0].currentOrderCount,1);
   assert.equal(db.posts[0].status,'closed');
   assert.equal((await accept()).status,409);

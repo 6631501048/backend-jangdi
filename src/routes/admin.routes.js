@@ -19,7 +19,9 @@ router.post("/jobs/:id/approve", approveJob); // FR-JOB-05–06, FR-MATCH-01–0
 router.post("/jobs/:id/reject", rejectJob); // FR-ADMIN-02
 router.get("/users", getUsers); // FR-ADMIN-03
 router.post("/users/:id/suspend", updateUserStatus); // FR-ADMIN-03
-router.get("/payments/escrow", getEscrowPayments); // FR-ADMIN-04
+router.get("/payments/escrow", getEscrowPayments);
+router.post('/payments/:id/slip-review', require('../controllers/slipPayment.controller').reviewInbound);
+router.post('/payments/:id/slips/:direction', ...require('../controllers/slipPayment.controller').submitOutbound); // FR-ADMIN-04
 router.post("/payments/:id/refund-decision", require('../controllers/refund.controller').decideRefund); // FR-ADMIN-05, FR-PAY-07
 router.get("/reports", getReports); // FR-ADMIN-06
 router.post("/reports/:id/resolve", resolveReport); // FR-ADMIN-06

@@ -312,13 +312,13 @@ const selectWorker = asyncHandler(async (req, res) => {
       // Hirer pays the transaction fee ON TOP of the job/service amount.
       // Keep this aligned with the Post Job UI (5% of the base job wage).
       const amount = Number(job.price) + Number(job.deliveryFee || 0);
-      const feePercent = Number(process.env.ESCROW_FEE_PERCENT_MIN) || 5;
+      const feePercent = require('../services/paymentTerms.service').feePercent();
       const feeAmount = Math.round(Number(job.price) * feePercent) / 100;
       await Payment.create([{
         job: job._id, hirer: job.hirer, worker: workerId, amount,
         platformFeePercent: feePercent, platformFeeAmount: feeAmount,
         netAmountToWorker: amount,
-        status: "pending", paymentMode: "demo",
+        status: "pending", paymentMode: "slip_demo", gatewayFeeAmount: 0,
       }], { session });
       await logJobStatusChange({
         jobId: job._id, previousStatus: "waiting", newStatus: "assigned",
@@ -452,7 +452,7 @@ const updateJobStatus = [
     if (next === "in_progress") {
       // No Worker can start until the Hirer has explicitly completed mock payment.
       const paid = await Payment.exists({ job: job._id, worker: req.user._id, status: "held",
-        $or: [{ paymentMode: { $in: ["demo", "stripe_test"] } }, { paymentMode: { $exists: false } }] });
+        $or: [{ paymentMode: { $in: ["demo", "stripe_test", "slip_demo"] } }, { paymentMode: { $exists: false } }] });
       if (!paid) return res.status(409).json({ message: "รอ Hirer กดยืนยันการชำระเงินจำลองก่อนเริ่มงาน" });
     }
     if (next === "in_progress" && req.file) {
@@ -671,6 +671,15 @@ const confirmCompletion = asyncHandler(async (req, res) => {
         const missingPayment = new Error("The demo payment is not in held state.");
         missingPayment.code = "PAYMENT_NOT_HELD";
         throw missingPayment;
+      }
+
+      if (payment.paymentMode === 'slip_demo') {
+        payment = await Payment.findOneAndUpdate(
+          { job: updated._id, hirer: updated.hirer, worker: updated.selectedWorker, status: 'released', paymentMode: 'slip_demo' },
+          { $set: { status: 'payout_pending', jobCompletedAt: confirmedAt, releasedAt: null } },
+          { new: true, runValidators: true, session }
+        );
+        if (!payment) throw new Error('Payment payout state changed during confirmation');
       }
 
       // Service Post quotas are concurrent, not lifetime totals. When a service-origin

@@ -234,14 +234,13 @@ const respondToServiceRequest = asyncHandler(async (req, res) => {
         selectedWorker: post.worker,
         originServiceRequest: request._id,
       });
-      const configPercent = Number(process.env.ESCROW_FEE_PERCENT_MIN);
-      const feePercent = configPercent >= 5 && configPercent <= 10 ? configPercent : 5;
+      const feePercent = require('../services/paymentTerms.service').feePercent();
       const feeAmount = Math.round(Number(post.fee) * feePercent) / 100;
       await Payment.create({
         job: job._id, hirer: request.hirer, worker: post.worker,
         amount: post.fee, platformFeePercent: feePercent,
         platformFeeAmount: feeAmount, netAmountToWorker: post.fee,
-        status: "pending", paymentMode: "demo",
+        status: "pending", paymentMode: "slip_demo", gatewayFeeAmount: 0,
       });
       await ServiceRequest.updateOne({ _id: request._id, status: "accepted" },
         { $set: { resultingJob: job._id } });

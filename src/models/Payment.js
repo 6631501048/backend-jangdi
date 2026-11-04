@@ -16,12 +16,12 @@ const paymentSchema = new mongoose.Schema(
     netAmountToWorker: { type: Number, required: true },
 
     // MVP simulation is never an actual transfer. Manual real-money flow comes after MVP.
-    paymentMode: { type: String, enum: ["demo", "manual", "stripe_test"], default: "demo" },
+    paymentMode: { type: String, enum: ["demo", "manual", "stripe_test", "slip_demo"], default: "slip_demo" },
 
     // FR-PAY-02: Pending -> Held -> Released, ทางเลือก Refunded, และ disputed ระหว่างทาง
     status: {
       type: String,
-      enum: ["pending", "held", "released", "refunded", "disputed"],
+      enum: ["pending", "awaiting_verification", "slip_rejected", "held", "payout_pending", "refund_pending", "released", "refunded", "disputed"],
       default: "pending",
     },
 
@@ -31,6 +31,18 @@ const paymentSchema = new mongoose.Schema(
 
     heldAt: { type: Date, default: null },
     releasedAt: { type: Date, default: null },
+    jobCompletedAt: { type: Date, default: null },
+    paidAt: { type: Date, default: null },
+    inboundSlipVersion: { type: String, default: null },
+    slipSubmittedAt: { type: Date, default: null },
+    slipReviewNotes: { type: String, default: null },
+    slipReviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    slipReviewedAt: { type: Date, default: null },
+    hasInboundSlip: { type: Boolean, default: false },
+    hasPayoutSlip: { type: Boolean, default: false },
+    hasRefundSlip: { type: Boolean, default: false },
+    slipEvidence: { type: { inbound: Buffer, payout: Buffer, refund: Buffer }, select: false },
+    slipAudit: [{ action: String, by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, at: Date, notes: String, version: String }],
 
     stripeSessionId: { type: String, default: null, index: true },
     stripePaymentIntentId: { type: String, default: null },
@@ -52,7 +64,7 @@ const paymentSchema = new mongoose.Schema(
     refundDecision: { type: String, enum: ["approved", "rejected", null], default: null },
     refundDecidedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
   },
-  { timestamps: true }
+  { timestamps: true, toJSON: { transform(doc, value) { delete value.slipEvidence; delete value.refundEvidence; return value; } } }
 );
 
 module.exports = mongoose.model("Payment", paymentSchema);

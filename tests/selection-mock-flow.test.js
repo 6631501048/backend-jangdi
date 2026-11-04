@@ -60,13 +60,13 @@ function seed() {
 const req = () => ({ params: { id: "j1" }, body: { workerId: "worker1" }, user: { _id: "hirer1" }, app: { get: () => null } });
 const response = () => ({ code: 200, body: null, status(n) { this.code = n; return this; }, json(item) { this.body = item; return this; } });
 async function call(handler, request) { const res = response(); let error; await handler(request, res, e => { error = e; }); if(error) throw error; return res; }
-test("selecting a Worker creates pending Demo payment and preserves applicant states", async () => {
+test("selecting a Worker creates pending slip-demo payment and preserves applicant states", async () => {
   seed();
   const out = await call(controller.selectWorker, req());
   assert.equal(out.code, 200);
   assert.equal(store.job.status, "assigned");
   assert.equal(store.payment.status, "pending");
-  assert.equal(store.payment.paymentMode, "demo");
+  assert.equal(store.payment.paymentMode, "slip_demo");
   assert.equal(store.payment.amount, 120);
   assert.equal(store.payment.platformFeeAmount, 5);
   assert.equal(store.payment.netAmountToWorker, 120);

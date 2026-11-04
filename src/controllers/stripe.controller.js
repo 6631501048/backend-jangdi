@@ -8,7 +8,7 @@ const createCheckout = asyncHandler(async (req,res) => {
   if (!job || String(job.hirer) !== String(req.user._id)) return res.status(403).json({message:'เฉพาะผู้ว่าจ้างของงานนี้เท่านั้น'});
   if (job.status !== 'assigned') return res.status(409).json({message:'งานไม่ได้อยู่ในสถานะรอชำระเงิน'});
   // Lock this pending record to Stripe before any external request. Mock confirmation cannot race it.
-  const payment = await Payment.findOneAndUpdate({job:job._id,hirer:req.user._id,status:'pending',paymentMode:{$in:['demo','stripe_test']}},{$set:{paymentMode:'stripe_test'}},{new:true});
+  const payment = await Payment.findOneAndUpdate({job:job._id,hirer:req.user._id,status:'pending',paymentMode:{$in:['demo','stripe_test','slip_demo']}},{$set:{paymentMode:'stripe_test'}},{new:true});
   if (!payment) return res.status(409).json({message:'รายการนี้ชำระแล้วหรือไม่สามารถชำระได้'});
   let session;
   if (payment.stripeSessionId) {

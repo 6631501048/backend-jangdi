@@ -41,9 +41,9 @@ const getEvidence = asyncHandler(async (req,res) => {
   if (!file) return res.status(404).json({message:'ไม่พบหลักฐาน'});
   res.set({'Content-Type':file.contentType,'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'}).send(file.data);
 });
-async function completeRefund(paymentId, refund) {
-  await withTransaction(async session => {
-    const payment = await Payment.findOneAndUpdate({_id:paymentId,status:'disputed',refundDecision:'approved'},{$set:{status:'refunded',refundedAt:new Date(),refundStatus:'succeeded',...(refund ? {stripeRefundId:refund.id}:{})}},{new:true,session});
+async function completeRefund(paymentId, refund, existingSession) {
+  const work = async session => {
+    const payment = await Payment.findOneAndUpdate({_id:paymentId,status:{$in:['disputed','refund_pending']},refundDecision:'approved'},{$set:{status:'refunded',refundedAt:new Date(),refundStatus:'succeeded',...(refund ? {stripeRefundId:refund.id}:{})}},{new:true,session});
     if (payment) {
       const job = await Job.findOneAndUpdate({_id:payment.job,status:'disputed'},{$set:{status:'cancelled',cancelledAt:new Date(),cancelReason:'ผู้ดูแลอนุมัติคืนเงิน'}},{new:true,session});
       if (job?.originServiceRequest) {
@@ -56,12 +56,25 @@ async function completeRefund(paymentId, refund) {
         }
       }
     }
-  });
+  };
+  if (existingSession) return work(existingSession);
+  return withTransaction(work);
 }
 const decideRefund = asyncHandler(async (req,res) => {
   const {decision,notes} = req.body;
   if (!mongoose.isValidObjectId(req.params.id) || !['approved','rejected'].includes(decision) || typeof notes !== 'string' || notes.trim().length < 10 || notes.trim().length > 1000) return res.status(400).json({message:'กรุณาระบุผลการพิจารณาและเหตุผล 10–1000 ตัวอักษร'});
   let payment;
+  if (decision === 'approved') {
+    const current = await Payment.findById(req.params.id);
+    if (current?.paymentMode === 'slip_demo') {
+      payment = await Payment.findOneAndUpdate({ _id: current._id, paymentMode: 'slip_demo', status: 'disputed', refundDecision: null }, {
+        $set: { status: 'refund_pending', refundDecision: 'approved', refundNotes: notes.trim(), refundDecidedBy: req.user._id, refundAmount: paidTotal(current), refundStatus: 'pending' },
+        $push: { slipAudit: { action: 'refund_approved', by: req.user._id, at: new Date(), notes: notes.trim() } },
+      }, { new: true, runValidators: true });
+      if (!payment) throw error('รายการนี้ถูกพิจารณาแล้ว');
+      return res.json({ message: 'อนุมัติแล้ว รอผู้ดูแลแนบสลิปคืนเงินจำลอง งานยังพักไว้จนกว่าจะบันทึกคืนเงิน' });
+    }
+  }
   if (decision === 'rejected') {
     await withTransaction(async session => {
       payment = await Payment.findOneAndUpdate({_id:req.params.id,status:'disputed',refundDecision:null},{$set:{status:'held',refundDecision:'rejected',refundNotes:notes.trim(),refundDecidedBy:req.user._id}},{new:true,session});
