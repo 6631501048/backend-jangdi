@@ -39,7 +39,9 @@ stub('../src/models',models);
 stub('../src/services/transaction.service',{withTransaction:work=>{
   const task=queue.then(async()=>{const snapshot=clone(store);try{return await work({});}catch(error){store=snapshot;throw error;}});queue=task.catch(()=>{});return task;
 }});
-stub('../src/services/notification.service',{createNotification:async value=>({...value,_id:'notification'}),deliverNotification:async()=>true,notifyUser:async()=>{}});
+stub('../src/services/notification.service',{createNotification:async value=>{if(store.failNotification)throw new Error('Outbox unavailable');const item={...value,_id:'notification'};store.notifications.push(item);return item;},deliverNotification:async()=>true,notifyUser:async()=>{}});
+let stripeCalls=[],refundStatus='pending';
+stub('../src/services/stripe.service',{request:async endpoint=>{stripeCalls.push(endpoint);return {id:'re_test_refund',status:refundStatus,livemode:false,currency:'thb',amount:10500,payment_intent:'pi_test',metadata:{paymentId:ids.payment}};}});
 stub('../src/services/jobLog.service',{logJobStatusChange:async()=>{}});
 stub('../src/services/matching.service',{notifyNearbyWorkers:async()=>{}});
 const slips=require('../src/controllers/slipPayment.controller');
@@ -66,7 +68,7 @@ test('four-eyes blocks the reviewer from paying themselves when enabled',async()
   reset();await inbound();await review();store.job.status='awaiting_confirmation';store.payment.status='payout_pending';process.env.REQUIRE_FOUR_EYES='1';
   try{assert.equal((await payout()).status,403);}finally{if(fourEyes===undefined)delete process.env.REQUIRE_FOUR_EYES;else process.env.REQUIRE_FOUR_EYES=fourEyes;}
 });
-function reset(){store={job:{_id:ids.job,hirer:ids.hirer,selectedWorker:ids.worker,status:'assigned',title:'งานทดสอบ',completionProofUrl:'/uploads/job-proofs/shared.png',completionProofStorage:'mongodb',completionProofData:png},payment:{_id:ids.payment,job:ids.job,hirer:ids.hirer,worker:ids.worker,status:'pending',paymentMode:'slip_demo',amount:100,platformFeeAmount:5,platformFeePercent:5,netAmountToWorker:100,stripeSessionId:null,refundDecision:null}};}
+function reset(){stripeCalls=[];refundStatus='pending';store={notifications:[],job:{_id:ids.job,hirer:ids.hirer,selectedWorker:ids.worker,status:'assigned',title:'งานทดสอบ',completionProofUrl:'/uploads/job-proofs/shared.png',completionProofStorage:'mongodb',completionProofData:png},payment:{_id:ids.payment,job:ids.job,hirer:ids.hirer,worker:ids.worker,status:'pending',paymentMode:'slip_demo',amount:100,platformFeeAmount:5,platformFeePercent:5,netAmountToWorker:100,stripeSessionId:null,refundDecision:null}};}
 async function request(path,{role='hirer',method='POST',body}={}){
   const headers={};if(role)headers.Authorization=`Bearer ${jwt.sign({id:ids[role]},process.env.JWT_SECRET)}`;
   if(body && !(body instanceof FormData))headers['Content-Type']='application/json';
@@ -95,6 +97,7 @@ test('Stripe evidence requires ownership and a session, stays private and never 
 });
 const review=(decision='approved',version=store.payment.inboundSlipVersion)=>request(`/admin/payments/${ids.payment}/slip-review`,{role:'admin',body:{decision,version,notes:'ตรวจสอบรูปและยอดชำระแล้ว'}});
 const payout=(bytes=png,extra={})=>{const body=form(bytes,'ตรวจยอดและจ่ายค่าจ้างจำลองแล้ว');body.append('amount','100');body.append('reference','TH202602000001');return request(`/admin/payments/${ids.payment}/slips/payout`,{role:'admin',body,...extra});};
+function refundForm(amount='105',reference='re_test_refund') { const body=form(png,'แนบหลักฐานการคืนเงินเต็มจำนวนแล้ว');body.append('amount',amount);body.append('reference',reference);return body; }
 async function completeJob(){store.job.status='awaiting_confirmation';return request(`/jobs/${ids.job}/confirm`,{body:{}});}
 test('anonymous, worker and outsiders cannot submit a hirer slip; ordinary users cannot approve',async()=>{
   reset();for(const role of [null,'worker','other']){const result=await request(`/payments/${ids.job}/slips/inbound`,{role,body:form()});assert.ok([401,403,409].includes(result.status));}
@@ -114,7 +117,7 @@ test('rejected slip can be replaced; stale admin version cannot approve a differ
 });
 test('full slip flow separates job completion from payment and prevents concurrent double payouts',async()=>{
   reset();await inbound();await review();assert.equal((await completeJob()).status,200);
-  assert.equal(store.job.status,'completed');assert.equal(store.payment.status,'payout_pending');assert.equal(store.payment.paidAt,undefined);
+  assert.equal(store.job.status,'completed');assert.equal(store.payment.status,'payout_pending');assert.equal(store.payment.paidAt,null);
   const results=await Promise.all([payout(),payout()]);assert.deepEqual(results.map(r=>r.status).sort(),[200,409]);
   assert.equal(store.payment.status,'released');assert.ok(store.payment.paidAt);assert.deepEqual(store.payment.slipEvidence.payout,png);assert.equal(store.payment.slipAudit.filter(item=>item.action==='payout_confirmed').length,1);
 });
@@ -127,9 +130,9 @@ test('approved refund waits for admin return slip before cancelling job and reco
   assert.equal((await request(`/admin/payments/${ids.payment}/refund-decision`,{role:'admin',body:{decision:'approved',notes:'ตรวจสอบหลักฐานและอนุมัติคืนเงิน'}})).status,200);
   assert.equal(store.payment.status,'refund_pending');assert.equal(store.payment.refundAmount,105);assert.equal(store.job.status,'disputed');
   const path=`/admin/payments/${ids.payment}/slips/refund`;
-  assert.equal((await request(path,{role:'admin',body:form(png,'ดำเนินการคืนเงินจำลองเต็มจำนวนแล้ว')})).status,200);
+  assert.equal((await request(path,{role:'admin',body:refundForm()})).status,200);
   assert.equal(store.payment.status,'refunded');assert.equal(store.job.status,'cancelled');assert.equal(store.payment.hasRefundSlip,true);
-  assert.equal((await request(path,{role:'admin',body:form(png,'ลองคืนซ้ำที่ต้องถูกปฏิเสธ')})).status,409);
+  assert.equal((await request(path,{role:'admin',body:refundForm()})).status,409);
 });
 test('slips stay private, ordinary payment JSON has no image bytes, and authorized parties can read',async()=>{
   reset();await inbound();
@@ -143,4 +146,47 @@ test('Stripe records cannot bypass webhook approval by posting a manual slip',as
 test('schema hides slip bytes from ordinary queries and JSON',()=>{
   const Model=require('../src/models/Payment');assert.equal(Model.schema.path('slipEvidence').options.select,false);
   const doc=new Model({slipEvidence:{inbound:png}});assert.equal(doc.toJSON().slipEvidence,undefined);
+});
+
+test('Stripe completion queues admin payout; roles cannot bypass it and worker sees the final proof',async()=>{
+  reset();Object.assign(store.payment,{paymentMode:'stripe_test',status:'held',stripeSessionId:'cs_test',stripePaymentIntentId:'pi_test'});
+  assert.equal((await request(`/jobs/${ids.job}/confirm`,{role:'worker',body:{}})).status,403);
+  assert.equal((await completeJob()).status,200);assert.equal(store.payment.status,'payout_pending');
+  assert.equal(store.payment.hasPayoutSlip,undefined);assert.equal(store.payment.paidAt,null);
+  assert.ok(store.notifications.some(n=>n.userId===ids.worker && n.title.includes('รอผู้ดูแล')));
+  for(const role of ['hirer','worker','other',null])assert.ok([401,403].includes((await payout(png,{role})).status));
+  const before=await request(`/payments/${ids.job}/mock`,{role:'worker',method:'GET'});
+  assert.equal((await before.json()).status,'payout_pending');
+  const attempts=await Promise.all([payout(),payout()]);assert.deepEqual(attempts.map(r=>r.status).sort(),[200,409]);
+  const after=await request(`/payments/${ids.job}/mock`,{role:'worker',method:'GET'});
+  const dto=await after.json();assert.equal(dto.status,'released');assert.equal(dto.hasPayoutSlip,true);assert.equal(dto.payoutAmount,100);assert.equal(dto.payoutReference,'TH202602000001');
+  assert.equal((await request(`/payments/${ids.payment}/slips/payout`,{role:'worker',method:'GET'})).status,200);
+  assert.equal((await request(`/payments/${ids.payment}/slips/payout`,{role:'other',method:'GET'})).status,404);
+  assert.equal(store.notifications.filter(n=>n.userId===ids.worker && n.title==='ผู้ดูแลบันทึกจ่ายค่าจ้างแล้ว').length,1);
+  assert.equal(stripeCalls.length,0);
+});
+
+test('outbox failure rolls back payout and its evidence, allowing a safe retry',async()=>{
+  reset();store.payment.status='held';await completeJob();store.failNotification=true;
+  assert.equal((await payout()).status,500);assert.equal(store.payment.status,'payout_pending');assert.equal(store.payment.hasPayoutSlip,undefined);
+  store.failNotification=false;assert.equal((await payout()).status,200);
+});
+
+test('Stripe refund proof requires provider success, does not repeat the refund and is private to hirer/admin',async()=>{
+  reset();Object.assign(store.payment,{paymentMode:'stripe_test',status:'held',stripePaymentIntentId:'pi_test'});
+  assert.equal((await request(`/payments/${ids.job}/refund`,{body:{reason:'งานไม่ตรงตามข้อตกลงจึงขอคืนเงิน'}})).status,200);
+  assert.equal((await request(`/admin/payments/${ids.payment}/refund-decision`,{role:'admin',body:{decision:'approved',notes:'ตรวจสอบและอนุมัติคืนเงินเต็มยอด'}})).status,200);
+  const path=`/admin/payments/${ids.payment}/slips/refund`;
+  assert.equal((await request(path,{role:'admin',body:refundForm()})).status,409);assert.equal(store.payment.hasRefundSlip,undefined);
+  await refund.recordStripeRefund(store.payment,{id:'re_test_refund',status:'succeeded',livemode:false,currency:'thb',amount:10500,payment_intent:'pi_test',metadata:{paymentId:ids.payment}});
+  assert.equal(store.payment.status,'refunded');assert.equal(store.job.status,'cancelled');
+  assert.equal((await request(path,{role:'admin',body:refundForm('104.99')})).status,409);
+  assert.equal((await request(path,{role:'admin',body:refundForm('105','re_wrong_refund')})).status,400);
+  const count=stripeCalls.length;
+  assert.equal((await request(path,{role:'hirer',body:refundForm()})).status,403);
+  assert.equal((await request(path,{role:'admin',body:refundForm()})).status,200);
+  assert.equal(store.payment.status,'refunded');assert.equal(store.payment.hasRefundSlip,true);assert.equal(stripeCalls.length,count);
+  for(const role of ['hirer','admin'])assert.equal((await request(`/payments/${ids.payment}/slips/refund`,{role,method:'GET'})).status,200);
+  for(const role of ['worker','other'])assert.equal((await request(`/payments/${ids.payment}/slips/refund`,{role,method:'GET'})).status,404);
+  assert.equal((await request(path,{role:'admin',body:refundForm()})).status,409);
 });

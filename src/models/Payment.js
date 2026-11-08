@@ -45,12 +45,18 @@ const paymentSchema = new mongoose.Schema(
     payoutSlipHash: { type: String, default: null },
     payoutAmount: { type: Number, default: null },
     payoutReference: { type: String, default: null },
+    refundReference: { type: String, default: null },
+    refundSlipHash: { type: String, default: null },
+    refundMethod: { type: String, enum: ['admin_transfer', 'stripe', null], default: null },
     slipEvidence: { type: { inbound: Buffer, payout: Buffer, refund: Buffer }, select: false },
     slipAudit: [{ action: String, by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, at: Date, notes: String, version: String }],
 
     stripeSessionId: { type: String, default: null, index: true },
     stripePaymentIntentId: { type: String, default: null },
     gatewayFeeAmount: { type: Number, default: null },
+    // Separate mock platform expense from any historical provider-reported fee.
+    mockGatewayFeePercent: { type: Number, min: 0, max: 100, default: null },
+    mockGatewayFeeAmount: { type: Number, min: 0, default: null },
     stripeRefundId: { type: String, default: null },
     refundStatus: { type: String, default: null },
     refundAmount: { type: Number, default: null },
@@ -72,4 +78,5 @@ const paymentSchema = new mongoose.Schema(
 );
 paymentSchema.index({ inboundSlipHash: 1 }, { unique: true, partialFilterExpression: { inboundSlipHash: { $type: "string" } } });
 paymentSchema.index({ payoutSlipHash: 1 }, { unique: true, partialFilterExpression: { payoutSlipHash: { $type: "string" } } });
+paymentSchema.index({ refundSlipHash: 1 }, { unique: true, partialFilterExpression: { refundSlipHash: { $type: "string" } } });
 module.exports = mongoose.model("Payment", paymentSchema);

@@ -14,7 +14,7 @@ test('completed work awaiting payout is counted as work, not a paid wage',()=>{
   const worker=overview([payment],false,window);assert.equal(worker.lifetime.total,0);assert.equal(worker.period.total,0);assert.equal(worker.period.completedJobs,1);assert.equal(worker.lifetime.payout_pending,100);
 });
 test('wages follow the payout date while job counts follow completion date',()=>{
-  const payment={...base,status:'released',paidAt:new Date('2026-12-01'),releasedAt:new Date('2026-12-01')};
+  const payment={...base,status:'released',hasPayoutSlip:true,paidAt:new Date('2026-12-01'),releasedAt:new Date('2026-12-01')};
   const november=overview([payment],false,window);assert.equal(november.period.total,0);assert.equal(november.period.completedJobs,1);
   const december=overview([payment],false,range({period:'custom',start:'2026-12-01',end:'2026-12-31'}));assert.equal(december.period.total,100);assert.equal(december.period.completedJobs,0);
 });
@@ -26,4 +26,32 @@ test('fee configuration defaults to five percent and accepts only five through t
   const before=process.env.ESCROW_FEE_PERCENT_MIN;
   try{for(const value of ['','0','4','11','bad']){process.env.ESCROW_FEE_PERCENT_MIN=value;assert.equal(feePercent(),5);}process.env.ESCROW_FEE_PERCENT_MIN='7.5';assert.equal(feePercent(),7.5);process.env.ESCROW_FEE_PERCENT_MIN='10';assert.equal(feePercent(),10);}
   finally{if(before===undefined)delete process.env.ESCROW_FEE_PERCENT_MIN;else process.env.ESCROW_FEE_PERCENT_MIN=before;}
+});
+
+test('Stripe worker earnings require a payout slip, and fee reports use only mock costs',()=>{
+  const payment={...base,paymentMode:'stripe_test',mockGatewayFeeAmount:3,mockGatewayFeePercent:3,gatewayFeeAmount:99,status:'payout_pending'};
+  let report=financials([payment],window);assert.equal(report.gatewayFees,3);assert.equal(report.netCash,102);assert.equal(report.workerPayouts,0);
+  assert.equal(overview([payment],false,window).lifetime.total,0);
+  const legacy={...payment,status:'released',releasedAt:new Date('2026-11-03')};
+  assert.equal(overview([legacy],false,window).lifetime.total,0);assert.equal(financials([legacy],window).workerPayouts,0);
+  const paid={...legacy,hasPayoutSlip:true,paidAt:new Date('2026-11-04')};
+  report=financials([paid],window);assert.equal(report.workerPayouts,100);assert.equal(report.netCash,2);
+  assert.equal(overview([paid],false,window).lifetime.total,100);
+});
+
+test('Stripe successful refunds are accounted once even while waiting for admin proof',()=>{
+  const row={...base,paymentMode:'stripe_test',status:'refunded',refundStatus:'succeeded',refundedAt:new Date('2026-11-03'),refundAmount:105,mockGatewayFeeAmount:3};
+  const waiting=financials([row],window);const withProof=financials([{...row,hasRefundSlip:true}],window);
+  assert.equal(waiting.refunds,105);assert.equal(withProof.refunds,105);assert.equal(waiting.netCash,-3);
+  assert.equal(waiting.pendingRefundEvidence,1);assert.equal(withProof.pendingRefundEvidence,0);
+});
+
+test('mock percentage accepts zero/decimals and rejects malformed configuration',()=>{
+  const {mockStripeFeePercent}=require('../src/services/paymentTerms.service');
+  const previous=process.env.MOCK_STRIPE_FEE_PERCENT;
+  try {
+    for(const value of ['', 'bad','-1','101','Infinity']){process.env.MOCK_STRIPE_FEE_PERCENT=value;assert.equal(mockStripeFeePercent(),3);}
+    process.env.MOCK_STRIPE_FEE_PERCENT='0';assert.equal(mockStripeFeePercent(),0);
+    process.env.MOCK_STRIPE_FEE_PERCENT='2.75';assert.equal(mockStripeFeePercent(),2.75);
+  } finally {if(previous===undefined)delete process.env.MOCK_STRIPE_FEE_PERCENT;else process.env.MOCK_STRIPE_FEE_PERCENT=previous;}
 });

@@ -7,7 +7,7 @@ const jwt=require('jsonwebtoken');
 const id={hirer:'507f1f77bcf86cd799439001',worker:'507f1f77bcf86cd799439002',other:'507f1f77bcf86cd799439003',admin:'507f1f77bcf86cd799439004',job:'507f1f77bcf86cd799439005',pay:'507f1f77bcf86cd799439006'};
 let payment,job,refundState,stripeCalls,checkoutSession;
 const users=Object.fromEntries(['hirer','worker','other','admin'].map(role=>[id[role],{_id:id[role],currentRole:role==='worker'?'worker':'hirer',isAdmin:role==='admin',accountStatus:'active'}]));
-const matches=(row,q)=>row && Object.entries(q).every(([k,v])=>v && typeof v==='object' && '$in' in v?v.$in.includes(row[k]??null):(row[k]??null)===(v??null));
+const matches=(row,q)=>row && Object.entries(q).every(([k,v])=>k==='$or'?v.some(condition=>matches(row,condition)):v && typeof v==='object' && '$in' in v?v.$in.includes(row[k]??null):v && typeof v==='object' && '$ne' in v?row[k]!==v.$ne:(row[k]??null)===(v??null));
 const chain=value=>({select(){return this;},populate(){return this;},sort(){return this;},lean(){return this;},then(resolve,reject){return Promise.resolve(value).then(resolve,reject);}});
 function update(row,q,change,options={}){if(!matches(row,q))return null;const old={...row};Object.assign(row,change.$set);return options.new===false?old:{...row};}
 function stub(relative,exports){const filename=require.resolve(relative);require.cache[filename]={id:filename,filename,loaded:true,exports};}
@@ -67,12 +67,12 @@ test('HTTP checkout and payment details enforce login, role and ownership',async
 
 test('HTTP signed raw webhook confirms server total exactly once and finance reconciles',async()=>{
   assert.equal((await sendEvent('checkout.session.completed',{},false)).status,400);
-  assert.equal((await paid()).status,200);assert.equal(payment.status,'held');assert.equal(payment.gatewayFeeAmount,4);
+  assert.equal((await paid()).status,200);assert.equal(payment.status,'held');assert.equal(payment.mockGatewayFeeAmount,3);
   await paid();assert.equal(payment.status,'held');
   const summary=await req('GET','/api/payments/overview?period=all','hirer');
   assert.equal(summary.data.lifetime.total,105);
   assert.equal((await req('GET','/api/payments/overview?period=all','other')).data.lifetime.total,0);
-  const admin=await req('GET','/api/admin/financials?period=all','admin');assert.equal(admin.data.gross,105);assert.equal(admin.data.gatewayFees,4);
+  const admin=await req('GET','/api/admin/financials?period=all','admin');assert.equal(admin.data.gross,105);assert.equal(admin.data.gatewayFees,3);
 });
 
 test('HTTP refund requires owner and admin, remains pending until Stripe success, and cannot repeat',async()=>{
@@ -88,7 +88,7 @@ test('HTTP refund requires owner and admin, remains pending until Stripe success
   assert.equal(payment.status,'refunded');assert.equal(job.status,'cancelled');
   assert.equal((await req('POST',decidePath,'admin',{decision:'approved',notes:'ตรวจสอบรายการและหลักฐานครบแล้ว'})).status,409);
   const totals=(await req('GET','/api/admin/financials?period=all','admin')).data;
-  assert.equal(totals.gross,105);assert.equal(totals.refunds,105);assert.equal(totals.netCash,-4);
+  assert.equal(totals.gross,105);assert.equal(totals.refunds,105);assert.equal(totals.netCash,-3);
   assert.equal(stripeCalls.filter(c=>c.options.method==='POST' && c.url.endsWith('/refunds')).length,1);
 });
 
@@ -100,7 +100,7 @@ test('HTTP sync requires login, role and ownership and confirms with no webhook 
   assert.equal((await req('POST',endpoint,'other')).status,404);assert.equal(stripeCalls.length,0);
   checkoutSession={livemode:false,status:'complete',payment_status:'paid',client_reference_id:id.pay,currency:'thb',amount_total:10500,payment_intent:'pi_test'};
   assert.equal((await req('POST',endpoint,'hirer')).data.status,'held');
-  assert.equal(payment.gatewayFeeAmount,4);
+  assert.equal(payment.mockGatewayFeeAmount,3);
   const count=stripeCalls.length;await req('POST',endpoint,'hirer');assert.equal(stripeCalls.length,count);
 });
 
@@ -111,4 +111,16 @@ test('HTTP sync reconciles an approved refund with no refund webhook delivery',a
   assert.equal(payment.status,'disputed');refundState='succeeded';
   assert.equal((await req('POST',`/api/payments/${id.job}/stripe/sync`,'hirer')).data.status,'refunded');
   assert.equal(job.status,'cancelled');
+});
+
+test('admin refund evidence queue includes successful Stripe refunds until proof is attached',async()=>{
+  await paid();
+  await req('POST',`/api/payments/${id.job}/refund-request`,'hirer',{reason:'ตรวจสอบคำขอคืนเงินทดสอบ'});
+  await req('POST',`/api/admin/payments/${id.pay}/refund-decision`,'admin',{decision:'approved',notes:'ตรวจสอบรายการและหลักฐานครบแล้ว'});
+  refundState='succeeded';await req('POST',`/api/payments/${id.job}/stripe/sync`,'hirer');
+  const endpoint='/api/admin/payments/escrow?status=refund_pending';
+  assert.equal((await req('GET',endpoint,'worker')).status,403);
+  assert.equal((await req('GET',endpoint,'admin')).data.length,1);
+  payment.hasRefundSlip=true;
+  assert.equal((await req('GET',endpoint,'admin')).data.length,0);
 });

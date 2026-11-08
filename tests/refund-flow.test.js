@@ -11,7 +11,7 @@ function update(kind,query,changes,options={}) {
 }
 function stub(relative,exports) { const filename=require.resolve(relative); require.cache[filename]={id:filename,filename,loaded:true,exports}; }
 stub('../src/models',{
-  Payment:{findOne:async query => matches(payment,query) ? {...payment} : null,findOneAndUpdate:async (...args)=>update('payment',...args),updateOne:async (...args)=>update('payment',...args),findById:()=>({select:async()=>payment})},
+  Payment:{findOne:async query => matches(payment,query) ? {...payment} : null,findOneAndUpdate:async (...args)=>update('payment',...args),updateOne:async (...args)=>update('payment',...args),findById:()=>({select:async()=>payment,then(resolve,reject){return Promise.resolve({...payment}).then(resolve,reject);}})},
   Job:{findOneAndUpdate:async (...args)=>update('job',...args),updateOne:async (...args)=>update('job',...args)},
 });
 stub('../src/services/transaction.service',{withTransaction:async work=>{
@@ -50,9 +50,9 @@ test('reject requires notes and restores the original work state',async()=>{
   reset();await submit();assert.equal((await invoke(controller.decideRefund,decision('rejected'))).status,200);assert.equal(job.status,'awaiting_confirmation');assert.equal(payment.status,'held');
   await assert.rejects(invoke(controller.decideRefund,decision('approved')));
 });
-test('demo approval refunds full customer amount and is committed once',async()=>{
+test('demo approval waits for admin proof and records the full customer amount without a gateway call',async()=>{
   reset();await submit();await invoke(controller.decideRefund,decision('approved'));
-  assert.equal(payment.refundAmount,105);assert.equal(payment.status,'refunded');assert.equal(job.status,'cancelled');assert.equal(stripeCalls.length,0);
+  assert.equal(payment.refundAmount,105);assert.equal(payment.status,'refund_pending');assert.equal(job.status,'disputed');assert.equal(stripeCalls.length,0);
   await assert.rejects(invoke(controller.decideRefund,decision('approved')));
 });
 test('Stripe pending refund does not claim money returned; retries reuse idempotency key',async()=>{

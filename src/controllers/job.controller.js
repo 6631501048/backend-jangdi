@@ -689,22 +689,13 @@ const confirmCompletion = asyncHandler(async (req, res) => {
 
       payment = await Payment.findOneAndUpdate(
         { job: updated._id, hirer: updated.hirer, worker: updated.selectedWorker, status: "held" },
-        { $set: { status: "released", releasedAt: confirmedAt } },
+        { $set: { status: "payout_pending", jobCompletedAt: confirmedAt, releasedAt: null, paidAt: null } },
         { new: true, runValidators: true, session }
       );
       if (!payment) {
         const missingPayment = new Error("The demo payment is not in held state.");
         missingPayment.code = "PAYMENT_NOT_HELD";
         throw missingPayment;
-      }
-
-      if (payment.paymentMode === 'slip_demo') {
-        payment = await Payment.findOneAndUpdate(
-          { job: updated._id, hirer: updated.hirer, worker: updated.selectedWorker, status: 'released', paymentMode: 'slip_demo' },
-          { $set: { status: 'payout_pending', jobCompletedAt: confirmedAt, releasedAt: null } },
-          { new: true, runValidators: true, session }
-        );
-        if (!payment) throw new Error('Payment payout state changed during confirmation');
       }
 
       // Service Post quotas are concurrent, not lifetime totals. When a service-origin
@@ -736,10 +727,10 @@ const confirmCompletion = asyncHandler(async (req, res) => {
       notifications.push(await createNotification({
         userId: updated.selectedWorker,
         type: "payment_update",
-        title: "Demo payment recorded",
-        message: `The demo payment for "${updated.title}" is recorded as released. No real transfer occurred.`,
-        relatedEntityType: "Payment",
-        relatedEntityId: payment._id,
+        title: "งานผ่านการตรวจรับแล้ว รอผู้ดูแลจ่ายค่าจ้าง",
+        message: `งาน "${updated.title}" เสร็จแล้ว ค่าจ้างอยู่ระหว่างรอผู้ดูแลบันทึกจ่ายพร้อมสลิป (โหมดทดสอบ ไม่มีการโอนเงินจริง)`,
+        relatedEntityType: "Job",
+        relatedEntityId: updated._id,
       }, session));
       notifications.push(await createNotification({
         userId: updated.selectedWorker,
@@ -764,7 +755,7 @@ const confirmCompletion = asyncHandler(async (req, res) => {
   await Promise.all(notifications.map((notification) => deliverNotification(io, notification)));
 
   res.json({
-    message: "Job confirmed. The payment record is in DEMO mode; no real transfer occurred.",
+    message: "ตรวจรับงานแล้ว รอ admin บันทึกจ่ายค่าจ้างพร้อมสลิป (โหมดทดสอบ ไม่มีการโอนเงินจริง)",
     job: updated,
     payment,
   });

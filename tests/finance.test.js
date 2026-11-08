@@ -30,8 +30,8 @@ test('unknown gateway cost is never presented as zero or final net',()=>{
   assert.equal(result.gatewayFees,null);assert.equal(result.netCash,null);assert.equal(result.held,105);
 });
 test('finance reconciles full customer refund and platform gateway expense',()=>{
-  const result=financials([{...payment,status:'refunded',refundedAt:new Date('2026-11-03'),refundAmount:105,gatewayFeeAmount:4}],range({period:'month'},now));
-  assert.equal(result.gross,105);assert.equal(result.refunds,105);assert.equal(result.netCash,-4);
+  const result=financials([{...payment,status:'refunded',refundedAt:new Date('2026-11-03'),refundAmount:105,gatewayFeeAmount:4,mockGatewayFeeAmount:3,mockGatewayFeePercent:3}],range({period:'month'},now));
+  assert.equal(result.gross,105);assert.equal(result.refunds,105);assert.equal(result.netCash,-3);
 });
 test('webhooks require authentic raw payload, fresh signature and test keys',()=>{
   process.env.STRIPE_WEBHOOK_SECRET='test_secret';process.env.STRIPE_SECRET_KEY='sk_test_example';

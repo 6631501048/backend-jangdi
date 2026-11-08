@@ -181,7 +181,7 @@ const getDashboard = asyncHandler(async (req, res) => {
     Job.countDocuments({ status: "pending_review" }),
     Sos.countDocuments({ status: "active" }),
     Payment.aggregate([
-      { $match: { status: "released", releasedAt: { $gte: startOfMonth } } },
+      { $match: { status: "released", hasPayoutSlip:true, paidAt: { $gte: startOfMonth } } },
       { $group: { _id: null, totalVolume: { $sum: "$amount" }, totalFees: { $sum: "$platformFeeAmount" }, count: { $sum: 1 } } },
     ]),
   ]);
@@ -268,10 +268,12 @@ const updateUserStatus = asyncHandler(async (req, res) => {
  */
 const getEscrowPayments = asyncHandler(async (req, res) => {
   const { status = "held" } = req.query;
-  const payments = await Payment.find({ status })
+  // Include completed Stripe refunds still waiting for admin evidence in the evidence queue.
+  const query = status === 'refund_pending' ? {$or:[{status:'refund_pending'},{status:'refunded',paymentMode:'stripe_test',refundStatus:'succeeded',hasRefundSlip:{$ne:true}}]} : {status};
+  const payments = await Payment.find(query)
     .populate("job", "title")
-    .populate("hirer", "fullName email")
-    .populate("worker", "fullName email")
+    .populate("hirer", "fullName email bankAccount")
+    .populate("worker", "fullName email bankAccount")
     .sort({ createdAt: -1 });
   res.json(payments);
 });
@@ -280,33 +282,8 @@ const getEscrowPayments = asyncHandler(async (req, res) => {
  * POST /api/admin/payments/:id/refund-decision — FR-ADMIN-05, FR-PAY-07
  * body: { decision: "approved" | "rejected" }
  */
-const decideRefund = asyncHandler(async (req, res) => {
-  const { decision } = req.body;
-  if (!["approved", "rejected"].includes(decision)) {
-    return res.status(400).json({ message: "decision ต้องเป็น approved หรือ rejected" });
-  }
-
-  const payment = await Payment.findById(req.params.id);
-  if (!payment) return res.status(404).json({ message: "ไม่พบรายการนี้" });
-
-  payment.refundDecision = decision;
-  payment.refundDecidedBy = req.user._id;
-  if (decision === "approved") {
-    payment.status = "refunded";
-  }
-  await payment.save();
-
-  await notifyUser(req.app.get("io"), {
-    userId: payment.hirer,
-    type: "payment_update",
-    title: decision === "approved" ? "คำขอคืนเงินได้รับการอนุมัติ" : "คำขอคืนเงินถูกปฏิเสธ",
-    message: `รายการชำระเงินของงาน ${payment.job}`,
-    relatedEntityType: "Payment",
-    relatedEntityId: payment._id,
-  });
-
-  res.json({ message: "บันทึกผลการพิจารณาคำขอคืนเงินสำเร็จ", payment });
-});
+// Keep the legacy export on the same guarded flow as the active admin route.
+const decideRefund = require('./refund.controller').decideRefund;
 
 /**
  * GET /api/admin/reports?status=pending — FR-ADMIN-06

@@ -43,7 +43,7 @@ const getEvidence = asyncHandler(async (req,res) => {
 });
 async function completeRefund(paymentId, refund, existingSession) {
   const work = async session => {
-    const payment = await Payment.findOneAndUpdate({_id:paymentId,status:{$in:['disputed','refund_pending']},refundDecision:'approved'},{$set:{status:'refunded',refundedAt:new Date(),refundStatus:'succeeded',...(refund ? {stripeRefundId:refund.id}:{})}},{new:true,session});
+    const payment = await Payment.findOneAndUpdate({_id:paymentId,status:{$in:['disputed','refund_pending']},refundDecision:'approved'},{$set:{status:'refunded',refundedAt:new Date(),refundStatus:'succeeded',...(refund ? {stripeRefundId:refund.id,refundMethod:'stripe'}:{})}},{new:true,session});
     if (payment) {
       const job = await Job.findOneAndUpdate({_id:payment.job,status:'disputed'},{$set:{status:'cancelled',cancelledAt:new Date(),cancelReason:'ผู้ดูแลอนุมัติคืนเงิน'}},{new:true,session});
       if (job?.originServiceRequest) {
@@ -78,9 +78,9 @@ const decideRefund = asyncHandler(async (req,res) => {
   let payment;
   if (decision === 'approved') {
     const current = await Payment.findById(req.params.id);
-    if (current?.paymentMode === 'slip_demo') {
-      payment = await Payment.findOneAndUpdate({ _id: current._id, paymentMode: 'slip_demo', status: 'disputed', refundDecision: null }, {
-        $set: { status: 'refund_pending', refundDecision: 'approved', refundNotes: notes.trim(), refundDecidedBy: req.user._id, refundAmount: paidTotal(current), refundStatus: 'pending' },
+    if (current && ['slip_demo','demo'].includes(current.paymentMode)) {
+      payment = await Payment.findOneAndUpdate({ _id: current._id, paymentMode: current.paymentMode, status: 'disputed', refundDecision: null }, {
+        $set: { status: 'refund_pending', refundDecision: 'approved', refundNotes: notes.trim(), refundDecidedBy: req.user._id, refundAmount: paidTotal(current), refundStatus: 'pending', refundMethod: 'admin_transfer' },
         $push: { slipAudit: { action: 'refund_approved', by: req.user._id, at: new Date(), notes: notes.trim() } },
       }, { new: true, runValidators: true });
       if (!payment) throw error('รายการนี้ถูกพิจารณาแล้ว');
@@ -95,7 +95,7 @@ const decideRefund = asyncHandler(async (req,res) => {
     });
   } else {
     // Persist approval before contacting Stripe; retries share one idempotency key.
-    payment = await Payment.findOneAndUpdate({_id:req.params.id,status:'disputed',paymentMode:{$in:['demo','stripe_test']},refundDecision:{$in:[null,'approved']}},{$set:{refundDecision:'approved',refundNotes:notes.trim(),refundDecidedBy:req.user._id}},{new:true});
+    payment = await Payment.findOneAndUpdate({_id:req.params.id,status:'disputed',paymentMode:'stripe_test',refundDecision:{$in:[null,'approved']}},{$set:{refundDecision:'approved',refundNotes:notes.trim(),refundDecidedBy:req.user._id}},{new:true});
     if (!payment) throw error('รายการนี้ถูกพิจารณาแล้ว');
     const amount = paidTotal(payment);
     await Payment.updateOne({_id:payment._id},{$set:{refundAmount:amount}});
@@ -108,8 +108,7 @@ const decideRefund = asyncHandler(async (req,res) => {
       await recordStripeRefund(payment,refund);
       if (['failed','canceled'].includes(refund.status)) throw error('Stripe คืนเงินไม่สำเร็จ กรุณาตรวจสอบรายการใน Stripe ก่อนดำเนินการต่อ');
       return res.json({message:refund.status === 'succeeded' ? 'Stripe ยืนยันคืนเงินเต็มจำนวนแล้ว' : 'อนุมัติแล้ว กำลังรอ Stripe ยืนยันการคืนเงิน'});
-    } else if ((payment.paymentMode || 'demo') === 'demo') await completeRefund(payment._id);
-    else throw error('รายการโอนเงินจริงต้องดำเนินการคืนเงินด้วยตนเอง');
+    } else throw error('รายการโอนเงินจริงต้องดำเนินการคืนเงินด้วยตนเอง');
   }
   res.json({message:decision === 'approved' ? 'บันทึกอนุมัติคืนเงินเต็มจำนวนรวมค่าบริการแล้ว':'ปฏิเสธคำขอและคืนงานสู่ขั้นตอนเดิมแล้ว'});
 });

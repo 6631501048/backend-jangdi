@@ -121,17 +121,17 @@ async function call(handler, req) {
   return res;
 }
 
-test("Hirer confirmation persists identity/time, transitions once, and releases demo held state", async () => {
+test("Hirer confirmation persists identity/time, transitions once, and queues wages for admin payout without releasing funds", async () => {
   seed();
   const res = await call(controller.confirmCompletion, reqFor());
   assert.equal(res.statusCode, 200);
   assert.equal(store.job.status, "completed");
   assert.equal(store.job.completionConfirmedBy, "hirer-1");
   assert.ok(store.job.completionConfirmedAt instanceof Date);
-  assert.equal(store.payment.status, "released");
+  assert.equal(store.payment.status, "payout_pending");
   assert.equal(store.logs.length, 1);
   assert.equal(store.casUpdates, 1);
-  assert.match(JSON.stringify(store.notifications), /No real transfer occurred/);
+  assert.match(JSON.stringify(store.notifications), /รอผู้ดูแลบันทึกจ่ายพร้อมสลิป/);
   assert.doesNotMatch(JSON.stringify(store.notifications), /real transfer happened/i);
 
   const again = await call(controller.confirmCompletion, reqFor());
@@ -210,7 +210,7 @@ test("simultaneous confirmation requests only commit once", async () => {
   ]);
   assert.deepEqual(results.map((result) => result.statusCode).sort(), [200, 409]);
   assert.equal(store.job.status, "completed");
-  assert.equal(store.payment.status, "released");
+  assert.equal(store.payment.status, "payout_pending");
   assert.equal(store.logs.length, 1);
   assert.equal(store.notifications.length, 2);
 });
@@ -221,7 +221,7 @@ test("notification delivery failure leaves durable pending records and does not 
   const response = await call(controller.confirmCompletion, reqFor());
   assert.equal(response.statusCode, 200);
   assert.equal(store.job.status, "completed");
-  assert.equal(store.payment.status, "released");
+  assert.equal(store.payment.status, "payout_pending");
   assert.equal(store.notifications.length, 2);
   assert.equal(store.delivered.length, 0);
 });

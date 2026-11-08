@@ -20,11 +20,11 @@ const getWallet = asyncHandler(async (req, res) => {
   const sumField = isHirer ? "amount" : "netAmountToWorker";
 
   const rows = await Payment.aggregate([
-    { $match: { [matchField]: req.user._id } },
+    { $match: { [matchField]: req.user._id, $or: [{status:{$ne:'released'}},{hasPayoutSlip:true,paidAt:{$ne:null}}] } },
     { $group: { _id: "$status", total: { $sum: `$${sumField}` } } },
   ]);
 
-  const totals = { pending: 0, held: 0, released: 0 };
+  const totals = { pending: 0, held: 0, released: 0, payout_pending: 0 };
   rows.forEach((r) => {
     if (r._id in totals) totals[r._id] = r.total;
   });
@@ -40,6 +40,7 @@ const getWallet = asyncHandler(async (req, res) => {
       availableBalance: totals.released, // Demo released state (no money transferred)
       pendingBalance: totals.pending, // Waiting for mock payment button
       inProgressBalance: totals.held, // Simulated held status
+      pendingPayoutBalance: totals.payout_pending,
     });
   }
 });
@@ -51,7 +52,7 @@ const getWallet = asyncHandler(async (req, res) => {
 const getSummary = asyncHandler(async (req, res) => {
   const isHirer = req.user.currentRole === "hirer";
   const { period = "all" } = req.query;
-  const match = { [isHirer ? "hirer" : "worker"]: req.user._id, status: "released" };
+  const match = { [isHirer ? "hirer" : "worker"]: req.user._id, status: "released", hasPayoutSlip:true, paidAt:{$ne:null} };
 
   const now = new Date();
   if (period === "month") {
@@ -82,7 +83,7 @@ const getTransactions = asyncHandler(async (req, res) => {
   const isHirer = req.user.currentRole === "hirer";
   const limit = Math.min(Number(req.query.limit) || 20, 100);
 
-  const payments = await Payment.find({ [isHirer ? "hirer" : "worker"]: req.user._id, status: "released" })
+  const payments = await Payment.find({ [isHirer ? "hirer" : "worker"]: req.user._id, status: "released", hasPayoutSlip:true, paidAt:{$ne:null} })
     .populate("job", "title")
     .sort({ releasedAt: -1 })
     .limit(limit);
@@ -109,6 +110,10 @@ const getMockPayment = asyncHandler(async (req, res) => {
   res.json({ jobId: payment.job, status: payment.status, paymentMode: payment.paymentMode || "demo",
     id: payment._id, hasStripeSession: !!payment.stripeSessionId, amount: payment.amount, platformFeeAmount: payment.platformFeeAmount,
     platformFeePercent: payment.platformFeePercent, netAmountToWorker: payment.netAmountToWorker,
+    mockGatewayFeePercent: payment.mockGatewayFeePercent, mockGatewayFeeAmount: payment.mockGatewayFeeAmount,
+    payoutReference: payment.payoutReference, payoutAmount: payment.payoutAmount,
+    refundReference: payment.refundReference, refundMethod: payment.refundMethod,
+    stripeRefundId: payment.stripeRefundId,
     inboundSlipVersion: payment.inboundSlipVersion, slipReviewNotes: payment.slipReviewNotes,
     hasInboundSlip: payment.hasInboundSlip, hasPayoutSlip: payment.hasPayoutSlip,
     hasRefundSlip: payment.hasRefundSlip, paidAt: payment.paidAt, jobCompletedAt: payment.jobCompletedAt,

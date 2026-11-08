@@ -53,7 +53,7 @@ test('webhook rejects forged signature and mismatched amount',async()=>{
 });
 test('valid paid webhook records gateway cost and repeated delivery releases no duplicate funds',async()=>{
   reset();payment.paymentMode='stripe_test';payment.stripeSessionId='cs_test_1';
-  assert.equal((await invoke(controller.webhook,event())).status,200);assert.equal(payment.status,'held');assert.equal(payment.gatewayFeeAmount,4);assert.equal(payment.stripePaymentIntentId,'pi_test');
+  assert.equal((await invoke(controller.webhook,event())).status,200);assert.equal(payment.status,'held');assert.equal(payment.mockGatewayFeeAmount,3);assert.equal(payment.stripePaymentIntentId,'pi_test');
   await invoke(controller.webhook,event());assert.equal(heldUpdates,1);
 });
 test('unpaid Checkout completion never marks a payment as held',async()=>{
@@ -140,7 +140,7 @@ test('server reconciliation works without a listener or webhook secret and is id
   const fetchIntent=global.fetch;
   global.fetch=async(url,options)=>url.includes('checkout/sessions/')?{ok:true,json:async()=>({id:'cs_test_1',livemode:false,client_reference_id:'pay1',payment_status:'paid',currency:'thb',amount_total:10500,payment_intent:'pi_test'})}:fetchIntent(url,options);
   assert.equal((await invoke(controller.syncPayment,request())).body.status,'held');
-  assert.equal(payment.gatewayFeeAmount,4);assert.equal(payment.stripePaymentIntentId,'pi_test');
+  assert.equal(payment.mockGatewayFeeAmount,3);assert.equal(payment.stripePaymentIntentId,'pi_test');
   await invoke(controller.syncPayment,request());assert.equal(heldUpdates,1);
 });
 
@@ -163,4 +163,17 @@ test('unpaid and expired sessions stay pending when reconciled',async()=>{
     assert.equal((await invoke(controller.syncPayment,request())).body.status,'pending');
     assert.equal(heldUpdates,0);
   }
+});
+
+test('mock fee rate is frozen per Checkout and never changes the charge or worker wage',async()=>{
+  reset();const previous=process.env.MOCK_STRIPE_FEE_PERCENT;
+  try {
+    process.env.MOCK_STRIPE_FEE_PERCENT='3';await invoke(controller.createCheckout,request());
+    assert.equal(payment.mockGatewayFeePercent,3);assert.equal(payment.mockGatewayFeeAmount,3);
+    process.env.MOCK_STRIPE_FEE_PERCENT='9';await invoke(controller.createCheckout,request());
+    await invoke(controller.webhook,event());
+    assert.equal(payment.mockGatewayFeeAmount,3);assert.equal(payment.mockGatewayFeePercent,3);
+    assert.equal(new URLSearchParams(apiCalls[0].options.body).get('line_items[0][price_data][unit_amount]'),'10500');
+    assert.equal(apiCalls.some(c=>c.url.includes('/payment_intents/')),false);
+  } finally {if(previous===undefined)delete process.env.MOCK_STRIPE_FEE_PERCENT;else process.env.MOCK_STRIPE_FEE_PERCENT=previous;}
 });
