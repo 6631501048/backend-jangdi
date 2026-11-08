@@ -1,7 +1,7 @@
 const crypto = require('node:crypto');
-function configured() { return /^sk_test_/.test(process.env.STRIPE_SECRET_KEY || '') && !!process.env.STRIPE_WEBHOOK_SECRET; }
+function configured() { return /^sk_test_/.test(process.env.STRIPE_SECRET_KEY || ''); }
 async function request(endpoint, {method='GET', params={}, key} = {}) {
-  if (!configured()) { const err = new Error('ยังไม่ได้ตั้งค่า Stripe โหมดทดสอบและ webhook ที่ backend'); err.statusCode=503; throw err; }
+  if (!configured()) { const err = new Error('ยังไม่ได้ตั้งค่า Stripe test key ที่ backend'); err.statusCode=503; throw err; }
   const query = new URLSearchParams(params);
   let response;
   try { response = await fetch(`https://api.stripe.com/v1/${endpoint}${method === 'GET' && query.size ? `?${query}` : ''}`, {

@@ -26,6 +26,24 @@ async function assignedJob(payment, session) {
   if (!job) throw fail('งานเปลี่ยนสถานะแล้ว กรุณาโหลดข้อมูลใหม่');
 }
 const getConfig = (req, res) => res.json(terms());
+// Stripe evidence is optional and never changes financial state or payment mode.
+const submitStripeEvidence = [
+  asyncHandler(async (req,res,next) => {
+    requireId(req.params.jobId);
+    const payment = await Payment.findOne({job:req.params.jobId,hirer:req.user._id,paymentMode:'stripe_test'});
+    if (!payment || !payment.stripeSessionId) throw fail('แนบหลักฐานได้เฉพาะรายการ Stripe ของคุณที่เปิดชำระแล้ว');
+    next();
+  }), parseSlip,
+  asyncHandler(async (req,res) => {
+    const bytes = imageBytes(req), version = randomUUID();
+    const payment = await Payment.findOneAndUpdate({job:req.params.jobId,hirer:req.user._id,paymentMode:'stripe_test',stripeSessionId:{$ne:null}}, {
+      $set:{'slipEvidence.inbound':bytes,hasInboundSlip:true,inboundSlipVersion:version,slipSubmittedAt:new Date()},
+      $push:{slipAudit:audit(req,'stripe_evidence_submitted','แนบหลักฐานประกอบรายการ Stripe (ไม่ใช้ยืนยันยอดเงิน)',version)},
+    },{new:true,runValidators:true});
+    if (!payment) throw fail('รายการเปลี่ยนแปลงแล้ว กรุณาโหลดใหม่');
+    res.json({message:'บันทึกหลักฐานแล้ว สถานะชำระเงินตรวจสอบจาก Stripe เท่านั้น'});
+  }),
+];
 const submitInbound = [
   asyncHandler(async (req, res, next) => {
     requireId(req.params.jobId);
@@ -136,4 +154,4 @@ const getSlip = asyncHandler(async (req, res) => {
   if (!image) return res.status(404).json({ message: 'ยังไม่มีสลิปสำหรับรายการนี้' });
   res.set({ 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' }).type(image.mime).send(bytes);
 });
-module.exports = { getConfig, submitInbound, reviewInbound, submitOutbound, getSlip };
+module.exports = { getConfig, submitInbound, reviewInbound, submitOutbound, getSlip, submitStripeEvidence };

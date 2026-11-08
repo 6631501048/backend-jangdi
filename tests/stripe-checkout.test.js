@@ -99,7 +99,7 @@ test('payment webhook rejects wrong owner reference or currency and ignores unre
 test('readiness response contains only booleans and never credentials',async()=>{
   reset();const result=await invoke(controller.getStripeStatus,{});
   assert.deepEqual(result.body,{ready:true,testKeyConfigured:true,webhookConfigured:true});
-  delete process.env.STRIPE_WEBHOOK_SECRET;assert.equal((await invoke(controller.getStripeStatus,{})).body.ready,false);
+  delete process.env.STRIPE_WEBHOOK_SECRET;assert.deepEqual((await invoke(controller.getStripeStatus,{})).body,{ready:true,testKeyConfigured:true,webhookConfigured:false});
 });
 
 test('old open card-only session is expired before a PromptPay-capable replacement is created',async()=>{
@@ -132,4 +132,35 @@ test('QR generation, expiry and async failure never mark money as received',asyn
   assert.equal(heldUpdates,0);
   await invoke(controller.webhook,event({},'checkout.session.async_payment_succeeded'));assert.equal(payment.status,'held');
   await invoke(controller.webhook,event({},'checkout.session.completed'));assert.equal(heldUpdates,1);
+});
+
+test('server reconciliation works without a listener or webhook secret and is idempotent',async()=>{
+  reset();delete process.env.STRIPE_WEBHOOK_SECRET;
+  payment.paymentMode='stripe_test';payment.stripeSessionId='cs_test_1';
+  const fetchIntent=global.fetch;
+  global.fetch=async(url,options)=>url.includes('checkout/sessions/')?{ok:true,json:async()=>({id:'cs_test_1',livemode:false,client_reference_id:'pay1',payment_status:'paid',currency:'thb',amount_total:10500,payment_intent:'pi_test'})}:fetchIntent(url,options);
+  assert.equal((await invoke(controller.syncPayment,request())).body.status,'held');
+  assert.equal(payment.gatewayFeeAmount,4);assert.equal(payment.stripePaymentIntentId,'pi_test');
+  await invoke(controller.syncPayment,request());assert.equal(heldUpdates,1);
+});
+
+test('reconciliation authorizes ownership and rejects mismatched or live sessions',async()=>{
+  reset();payment.paymentMode='stripe_test';payment.stripeSessionId='cs_test_1';
+  assert.equal((await invoke(controller.syncPayment,{...request(),user:{_id:'outsider'}})).status,404);
+  assert.equal(apiCalls.length,0);
+  for(const wrong of [{amount_total:1},{currency:'usd'},{client_reference_id:'other'},{id:'cs_other'},{livemode:true}]){
+    global.fetch=async()=>({ok:true,json:async()=>({id:'cs_test_1',livemode:false,client_reference_id:'pay1',payment_status:'paid',currency:'thb',amount_total:10500,...wrong})});
+    if(wrong.livemode)assert.equal((await invoke(controller.syncPayment,request())).status,400);
+    else await assert.rejects(invoke(controller.syncPayment,request()),{statusCode:400});
+    assert.equal(payment.status,'pending');
+  }
+});
+
+test('unpaid and expired sessions stay pending when reconciled',async()=>{
+  reset();payment.paymentMode='stripe_test';payment.stripeSessionId='cs_test_1';
+  for(const status of ['open','expired','complete']){
+    global.fetch=async()=>({ok:true,json:async()=>({id:'cs_test_1',livemode:false,status,payment_status:'unpaid'})});
+    assert.equal((await invoke(controller.syncPayment,request())).body.status,'pending');
+    assert.equal(heldUpdates,0);
+  }
 });

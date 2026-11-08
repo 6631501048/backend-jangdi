@@ -2,13 +2,43 @@ const asyncHandler = require('express-async-handler');
 const {Payment,Job} = require('../models');
 const stripe = require('../services/stripe.service');
 const {paidTotal} = require('../services/finance.service');
+// Shared by signed webhooks and server-to-server reconciliation. Never trust browser totals.
+async function recordPaidSession(payment, session, heldAt = new Date()) {
+  if (session.livemode === true || session.payment_status !== 'paid') return;
+  if (session.id !== payment.stripeSessionId || String(payment._id) !== session.client_reference_id || session.currency !== 'thb' || session.amount_total !== Math.round(paidTotal(payment)*100)) {
+    throw Object.assign(new Error('Payment amount mismatch'), {statusCode:400});
+  }
+  if (payment.status !== 'pending') return;
+  let gatewayFeeAmount = null;
+  if (session.payment_intent) {
+    const intent = await stripe.request(`payment_intents/${session.payment_intent}`,{params:{'expand[]':'latest_charge.balance_transaction'}});
+    const balance = intent.latest_charge?.balance_transaction;
+    if (balance && typeof balance === 'object' && balance.currency === 'thb') gatewayFeeAmount = balance.fee/100;
+  }
+  await Payment.updateOne({_id:payment._id,status:'pending',paymentMode:'stripe_test',stripeSessionId:session.id},{$set:{status:'held',heldAt,stripePaymentIntentId:session.payment_intent,gatewayFeeAmount}});
+}
+const syncPayment = asyncHandler(async (req,res) => {
+  const payment = await Payment.findOne({job:req.params.jobId,hirer:req.user._id,paymentMode:'stripe_test'});
+  if (!payment) return res.status(404).json({message:'ไม่พบรายการ Stripe ของคุณสำหรับงานนี้'});
+  if (payment.status === 'pending' && payment.stripeSessionId) {
+    const session = await stripe.request(`checkout/sessions/${payment.stripeSessionId}`);
+    if (session.livemode !== false) return res.status(400).json({message:'Only test sessions are accepted'});
+    await recordPaidSession(payment,session);
+  }
+  if (payment.status === 'disputed' && payment.refundDecision === 'approved' && payment.stripeRefundId) {
+    const refund = await stripe.request(`refunds/${payment.stripeRefundId}`);
+    await require('./refund.controller').recordStripeRefund(payment,refund);
+  }
+  const current = await Payment.findOne({_id:payment._id,hirer:req.user._id});
+  res.json({status:current.status,message:current.status === 'pending' ? 'Stripe ยังไม่ยืนยันการชำระเงิน' : 'ตรวจสอบสถานะกับ Stripe แล้ว'});
+});
 const getStripeStatus = (req,res) => res.json({
   ready: stripe.configured(),
   testKeyConfigured: /^sk_test_/.test(process.env.STRIPE_SECRET_KEY || ''),
   webhookConfigured: !!process.env.STRIPE_WEBHOOK_SECRET,
 });
 const createCheckout = asyncHandler(async (req,res) => {
-  if (!stripe.configured()) return res.status(503).json({message:'กรุณาตั้งค่า Stripe test key และ webhook ที่ backend ก่อน'});
+  if (!stripe.configured()) return res.status(503).json({message:'กรุณาตั้งค่า Stripe test key ที่ backend ก่อน'});
   const job = await Job.findById(req.params.jobId);
   if (!job || String(job.hirer) !== String(req.user._id)) return res.status(403).json({message:'เฉพาะผู้ว่าจ้างของงานนี้เท่านั้น'});
   if (job.status !== 'assigned') return res.status(409).json({message:'งานไม่ได้อยู่ในสถานะรอชำระเงิน'});
@@ -24,7 +54,7 @@ const createCheckout = asyncHandler(async (req,res) => {
       // Close the old card-only session before replacing it: never leave two payable sessions.
       await stripe.request(`checkout/sessions/${session.id}/expire`,{method:'POST',key:`checkout-promptpay-expire-${session.id}`});
     }
-    if (session.status === 'complete') return res.status(409).json({message:'ชำระแล้ว กำลังรอ webhook ยืนยัน กรุณารีเฟรชภายหลัง'});
+    if (session.status === 'complete') return res.status(409).json({message:'ปิดขั้นตอน Checkout แล้ว กรุณาตรวจสอบสถานะล่าสุดเพื่อยืนยันผลจาก Stripe'});
   }
   const base = new URL(process.env.CLIENT_URL || 'http://localhost:5173');
   const returnUrl = new URL(`/hirer/my-jobs/${job._id}/mock-payment`,base).href;
@@ -50,13 +80,7 @@ const webhook = asyncHandler(async (req,res) => {
     }
     if (String(payment._id) !== session.client_reference_id || session.currency !== 'thb' || session.amount_total !== Math.round(paidTotal(payment)*100)) return res.status(400).json({message:'Payment amount mismatch'});
     if (payment.status !== 'pending') return res.json({received:true});
-    let gatewayFeeAmount = null;
-    if (session.payment_intent) {
-      const intent = await stripe.request(`payment_intents/${session.payment_intent}`,{params:{'expand[]':'latest_charge.balance_transaction'}});
-      const balance = intent.latest_charge?.balance_transaction;
-      if (balance && typeof balance === 'object' && balance.currency === 'thb') gatewayFeeAmount = balance.fee/100;
-    }
-    await Payment.updateOne({_id:payment._id,status:'pending',paymentMode:'stripe_test'},{$set:{status:'held',heldAt:new Date(event.created*1000),stripePaymentIntentId:session.payment_intent,gatewayFeeAmount}});
+    await recordPaidSession(payment,session,new Date(event.created*1000));
   }
   if (['refund.updated','refund.created','refund.failed'].includes(event.type)) {
     const refund = event.data.object;
@@ -69,4 +93,4 @@ const webhook = asyncHandler(async (req,res) => {
   }
   res.json({received:true});
 });
-module.exports = {createCheckout,webhook,getStripeStatus};
+module.exports = {createCheckout,webhook,getStripeStatus,syncPayment};

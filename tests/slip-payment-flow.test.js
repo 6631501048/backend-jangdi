@@ -49,6 +49,7 @@ const paymentController=require('../src/controllers/payment.controller');
 const {protect,adminOnly,requireRole}=require('../src/middleware/auth.middleware');
 const app=express();app.use(express.json());
 app.post('/payments/:jobId/slips/inbound',protect,requireRole('hirer'),...slips.submitInbound);
+app.post('/payments/:jobId/stripe/slip',protect,requireRole('hirer'),...slips.submitStripeEvidence);
 app.get('/payments/:id/slips/:direction',protect,slips.getSlip);
 app.get('/payments/:jobId/mock',protect,paymentController.getMockPayment);
 app.post('/payments/:jobId/refund',protect,requireRole('hirer'),...refund.requestRefund);
@@ -73,6 +74,25 @@ async function request(path,{role='hirer',method='POST',body}={}){
 }
 function form(bytes=png,notes){const body=new FormData();body.append('slip',new Blob([bytes],{type:'image/png'}),'slip.png');if(notes)body.append('notes',notes);return body;}
 const inbound=()=>request(`/payments/${ids.job}/slips/inbound`,{body:form()});
+
+test('Stripe evidence requires ownership and a session, stays private and never marks funds received',async()=>{
+  reset();store.payment.paymentMode='stripe_test';
+  const endpoint=`/payments/${ids.job}/stripe/slip`;
+  assert.equal((await request(endpoint,{body:form()})).status,409);
+  store.payment.stripeSessionId='cs_test_evidence';
+  for(const role of [null,'worker','other'])assert.ok([401,403,409].includes((await request(endpoint,{role,body:form()})).status));
+  assert.equal((await request(endpoint,{body:form(Buffer.from('not an image'))})).status,400);
+  for(const status of ['pending','held','released','disputed','refunded']){
+    store.payment.status=status;
+    assert.equal((await request(endpoint,{body:form()})).status,200);
+    assert.equal(store.payment.status,status);assert.equal(store.payment.paymentMode,'stripe_test');
+    assert.equal(store.payment.hasInboundSlip,true);assert.ok(store.payment.inboundSlipVersion);
+    assert.equal(store.payment.slipAudit.at(-1).action,'stripe_evidence_submitted');
+  }
+  const proof=await request(`/payments/${ids.payment}/slips/inbound`,{method:'GET'});
+  assert.equal(proof.status,200);assert.equal(proof.headers.get('cache-control'),'private, no-store');
+  assert.equal((await request(`/payments/${ids.payment}/slips/inbound`,{role:'other',method:'GET'})).status,404);
+});
 const review=(decision='approved',version=store.payment.inboundSlipVersion)=>request(`/admin/payments/${ids.payment}/slip-review`,{role:'admin',body:{decision,version,notes:'ตรวจสอบรูปและยอดชำระแล้ว'}});
 const payout=(bytes=png,extra={})=>{const body=form(bytes,'ตรวจยอดและจ่ายค่าจ้างจำลองแล้ว');body.append('amount','100');body.append('reference','TH202602000001');return request(`/admin/payments/${ids.payment}/slips/payout`,{role:'admin',body,...extra});};
 async function completeJob(){store.job.status='awaiting_confirmation';return request(`/jobs/${ids.job}/confirm`,{body:{}});}

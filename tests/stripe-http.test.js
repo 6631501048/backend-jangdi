@@ -5,7 +5,7 @@ const assert=require('node:assert/strict');
 const crypto=require('node:crypto');
 const jwt=require('jsonwebtoken');
 const id={hirer:'507f1f77bcf86cd799439001',worker:'507f1f77bcf86cd799439002',other:'507f1f77bcf86cd799439003',admin:'507f1f77bcf86cd799439004',job:'507f1f77bcf86cd799439005',pay:'507f1f77bcf86cd799439006'};
-let payment,job,refundState,stripeCalls;
+let payment,job,refundState,stripeCalls,checkoutSession;
 const users=Object.fromEntries(['hirer','worker','other','admin'].map(role=>[id[role],{_id:id[role],currentRole:role==='worker'?'worker':'hirer',isAdmin:role==='admin',accountStatus:'active'}]));
 const matches=(row,q)=>row && Object.entries(q).every(([k,v])=>v && typeof v==='object' && '$in' in v?v.$in.includes(row[k]??null):(row[k]??null)===(v??null));
 const chain=value=>({select(){return this;},populate(){return this;},sort(){return this;},lean(){return this;},then(resolve,reject){return Promise.resolve(value).then(resolve,reject);}});
@@ -28,7 +28,7 @@ global.fetch=async(url,options)=>{
   stripeCalls.push({url,options});
   const data=String(url).includes('/refunds')?{id:'re_test',livemode:false,status:refundState,currency:'thb',amount:10500,payment_intent:'pi_test',metadata:{paymentId:id.pay}}:
     String(url).includes('/payment_intents/')?{latest_charge:{balance_transaction:{currency:'thb',fee:400}}}:
-    {id:'cs_test',status:'open',url:'https://checkout.stripe.com/c/pay/test'};
+    {id:'cs_test',status:'open',url:'https://checkout.stripe.com/c/pay/test',...checkoutSession};
   return {ok:true,json:async()=>data};
 };
 process.env.JWT_SECRET='stripe-http-test-only-secret-at-least-32-characters';
@@ -39,7 +39,7 @@ test.before(async()=>{server=app.listen(0,'127.0.0.1');await new Promise(resolve
 test.after(async()=>{global.fetch=nativeFetch;server.closeAllConnections();await new Promise(resolve=>server.close(resolve));});
 test.beforeEach(()=>{
   payment={_id:id.pay,job:id.job,hirer:id.hirer,worker:id.worker,paymentMode:'slip_demo',status:'pending',amount:100,platformFeePercent:5,platformFeeAmount:5,netAmountToWorker:100,refundDecision:null,createdAt:new Date()};
-  job={_id:id.job,hirer:id.hirer,selectedWorker:id.worker,status:'assigned',title:'Stripe HTTP test'};refundState='pending';stripeCalls=[];
+  job={_id:id.job,hirer:id.hirer,selectedWorker:id.worker,status:'assigned',title:'Stripe HTTP test'};refundState='pending';stripeCalls=[];checkoutSession={};
 });
 async function req(method,path,role,body){
   const response=await nativeFetch(base+path,{method,headers:{'Content-Type':'application/json',...(role?{Authorization:`Bearer ${jwt.sign({id:id[role]},process.env.JWT_SECRET)}`}:{})},...(body?{body:JSON.stringify(body)}:{})});
@@ -90,4 +90,25 @@ test('HTTP refund requires owner and admin, remains pending until Stripe success
   const totals=(await req('GET','/api/admin/financials?period=all','admin')).data;
   assert.equal(totals.gross,105);assert.equal(totals.refunds,105);assert.equal(totals.netCash,-4);
   assert.equal(stripeCalls.filter(c=>c.options.method==='POST' && c.url.endsWith('/refunds')).length,1);
+});
+
+test('HTTP sync requires login, role and ownership and confirms with no webhook delivery',async()=>{
+  await req('POST',`/api/payments/${id.job}/checkout`,'hirer');stripeCalls=[];
+  const endpoint=`/api/payments/${id.job}/stripe/sync`;
+  assert.equal((await req('POST',endpoint)).status,401);
+  assert.equal((await req('POST',endpoint,'worker')).status,403);
+  assert.equal((await req('POST',endpoint,'other')).status,404);assert.equal(stripeCalls.length,0);
+  checkoutSession={livemode:false,status:'complete',payment_status:'paid',client_reference_id:id.pay,currency:'thb',amount_total:10500,payment_intent:'pi_test'};
+  assert.equal((await req('POST',endpoint,'hirer')).data.status,'held');
+  assert.equal(payment.gatewayFeeAmount,4);
+  const count=stripeCalls.length;await req('POST',endpoint,'hirer');assert.equal(stripeCalls.length,count);
+});
+
+test('HTTP sync reconciles an approved refund with no refund webhook delivery',async()=>{
+  await paid();
+  await req('POST',`/api/payments/${id.job}/refund-request`,'hirer',{reason:'ตรวจสอบคำขอคืนเงินทดสอบ'});
+  await req('POST',`/api/admin/payments/${id.pay}/refund-decision`,'admin',{decision:'approved',notes:'ตรวจสอบรายการและหลักฐานครบแล้ว'});
+  assert.equal(payment.status,'disputed');refundState='succeeded';
+  assert.equal((await req('POST',`/api/payments/${id.job}/stripe/sync`,'hirer')).data.status,'refunded');
+  assert.equal(job.status,'cancelled');
 });
