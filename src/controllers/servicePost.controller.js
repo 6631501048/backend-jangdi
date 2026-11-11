@@ -110,13 +110,24 @@ const getMyServicePosts = asyncHandler(async (req, res) => {
 
 /** POST /api/service-posts/:id/close — FR-SERV-03 */
 const closeServicePost = asyncHandler(async (req, res) => {
+  const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+  if (reason.length < 5 || reason.length > 500) {
+    return res.status(400).json({ message: "กรุณาระบุเหตุผลอย่างน้อย 5 ตัวอักษรและไม่เกิน 500 ตัวอักษร" });
+  }
   const post = await ServicePost.findById(req.params.id);
   if (!post) return res.status(404).json({ message: "ไม่พบประกาศบริการนี้" });
   if (String(post.worker) !== String(req.user._id)) {
     return res.status(403).json({ message: "คุณไม่ใช่เจ้าของประกาศนี้" });
   }
+  if (post.status !== "active" || Date.now() - new Date(post.createdAt).getTime() < 5 * 60 * 1000) {
+    return res.status(409).json({ message: "ขอยกเลิกได้หลังประกาศเปิดรับบริการครบ 5 นาที" });
+  }
+  if (await ServiceRequest.exists({ servicePost: post._id })) {
+    return res.status(409).json({ message: "มีคำขอรับบริการเข้ามาแล้ว จึงไม่สามารถยกเลิกประกาศได้" });
+  }
   post.status = "closed";
   post.closeReason = "manual";
+  post.closeNote = reason;
   await post.save();
   res.json({ message: "ปิดประกาศบริการสำเร็จ", post });
 });
