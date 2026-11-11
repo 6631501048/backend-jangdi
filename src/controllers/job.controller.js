@@ -206,7 +206,10 @@ const cancelJob = asyncHandler(async (req, res) => {
  */
 const getFeed = asyncHandler(async (req, res) => {
   const { category, search } = req.query;
-  const query = { status: "waiting" };
+  // Exclude legacy/inconsistent records that still say "waiting" even though
+  // completion has already been confirmed. Null also matches older documents
+  // where the optional completion field was never stored.
+  const query = { status: "waiting", completionConfirmedAt: null };
   if (category && category !== "all") query.category = category;
   if (search) {
     query.$or = [

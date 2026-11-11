@@ -15,7 +15,32 @@ const getServicePosts = asyncHandler(async (req, res) => {
   const posts = await ServicePost.find(query)
     .populate("worker", "fullName avatarUrl credibilityScore")
     .sort({ createdAt: -1 });
-  res.json(posts);
+  if (!posts.length) return res.json([]);
+
+  // A service listing can be reopened when its last order finishes to release
+  // its concurrent-order slot. Do not put that old listing back in public
+  // feeds once it has completed all accepted work and has no pending requests.
+  const requests = await ServiceRequest.find({
+    servicePost: { $in: posts.map((post) => post._id) },
+    $or: [{ status: "pending" }, { resultingJob: { $ne: null } }],
+  })
+    .populate("resultingJob", "status")
+    .select("servicePost status resultingJob");
+  const requestStates = new Map();
+  for (const request of requests) {
+    const key = String(request.servicePost);
+    const state = requestStates.get(key) || { pending: false, inProgress: false, completed: false };
+    if (request.status === "pending") state.pending = true;
+    const jobStatus = request.resultingJob?.status;
+    if (["assigned", "in_progress", "awaiting_confirmation"].includes(jobStatus)) state.inProgress = true;
+    if (jobStatus === "completed") state.completed = true;
+    requestStates.set(key, state);
+  }
+  const visiblePosts = posts.filter((post) => {
+    const state = requestStates.get(String(post._id));
+    return !state?.completed || state.pending || state.inProgress;
+  });
+  res.json(visiblePosts);
 });
 
 /** GET /api/service-posts/:id */
