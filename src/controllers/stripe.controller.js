@@ -9,8 +9,12 @@ async function recordPaidSession(payment, session, heldAt = new Date()) {
     throw Object.assign(new Error('Payment amount mismatch'), {statusCode:400});
   }
   if (payment.status !== 'pending') return;
-  const percent = payment.mockGatewayFeePercent ?? require('../services/paymentTerms.service').mockStripeFeePercent();
-  await Payment.updateOne({_id:payment._id,status:'pending',paymentMode:'stripe_test',stripeSessionId:session.id},{$set:{status:'held',heldAt,stripePaymentIntentId:session.payment_intent,mockGatewayFeePercent:percent,mockGatewayFeeAmount:Math.round(payment.amount*percent)/100}});
+  const terms = require('../services/paymentTerms.service');
+  const percent = payment.mockGatewayFeePercent ?? terms.mockStripeFeePercent();
+  const fixed = payment.mockGatewayFeeFixedAmount ?? terms.terms().mockStripeFixedFeeAmount;
+  const chargeAmount = payment.amount + payment.platformFeeAmount;
+  const gatewayFee = Math.round((chargeAmount * percent / 100 + fixed) * 100) / 100;
+  await Payment.updateOne({_id:payment._id,status:'pending',paymentMode:'stripe_test',stripeSessionId:session.id},{$set:{status:'held',heldAt,stripePaymentIntentId:session.payment_intent,mockGatewayFeePercent:percent,mockGatewayFeeFixedAmount:fixed,mockGatewayFeeAmount:gatewayFee}});
 }
 const syncPayment = asyncHandler(async (req,res) => {
   const payment = await Payment.findOne({job:req.params.jobId,hirer:req.user._id,paymentMode:'stripe_test'});
@@ -41,9 +45,13 @@ const createCheckout = asyncHandler(async (req,res) => {
   const payment = await Payment.findOneAndUpdate({job:job._id,hirer:req.user._id,worker:job.selectedWorker,status:'pending',paymentMode:{$in:['demo','stripe_test','slip_demo']}},{$set:{paymentMode:'stripe_test'}},{new:true});
   if (!payment) return res.status(409).json({message:'รายการนี้ชำระแล้วหรือไม่สามารถชำระได้'});
   // Freeze the mock rate once; changing configuration cannot change a payable session's fee.
-  if (payment.mockGatewayFeePercent == null) {
-    const percent = require('../services/paymentTerms.service').mockStripeFeePercent();
-    await Payment.updateOne({_id:payment._id,status:'pending',paymentMode:'stripe_test',mockGatewayFeePercent:null},{$set:{mockGatewayFeePercent:percent,mockGatewayFeeAmount:Math.round(payment.amount*percent)/100}});
+  if (payment.mockGatewayFeePercent == null || payment.mockGatewayFeeFixedAmount == null || payment.mockGatewayFeeAmount == null) {
+    const terms = require('../services/paymentTerms.service');
+    const percent = payment.mockGatewayFeePercent ?? terms.mockStripeFeePercent();
+    const fixed = payment.mockGatewayFeeFixedAmount ?? terms.terms().mockStripeFixedFeeAmount;
+    const chargeAmount = payment.amount + payment.platformFeeAmount;
+    const gatewayFee = Math.round((chargeAmount * percent / 100 + fixed) * 100) / 100;
+    await Payment.updateOne({_id:payment._id,status:'pending',paymentMode:'stripe_test',mockGatewayFeePercent:payment.mockGatewayFeePercent},{$set:{mockGatewayFeePercent:percent,mockGatewayFeeFixedAmount:fixed,mockGatewayFeeAmount:gatewayFee}});
   }
   let session;
   if (payment.stripeSessionId) {

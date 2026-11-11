@@ -32,24 +32,39 @@ const getServicePostById = asyncHandler(async (req, res) => {
  */
 const createServicePost = asyncHandler(async (req, res) => {
   const {
-    category, title, description, fee, maxSimultaneousOrders,
+    category, serviceType, title, locationLabel, description, fee, maxSimultaneousOrders,
     availabilityStart, availabilityEnd, serviceRadiusMeters, lat, lng,
   } = req.body;
 
   if (!category || !title || !description || fee == null || !maxSimultaneousOrders || !availabilityStart || !availabilityEnd || lat == null || lng == null) {
     return res.status(400).json({ message: "กรุณากรอกข้อมูลให้ครบ" });
   }
+  if (category === "delivery" && !["shopping", "pickup_delivery", "passenger"].includes(serviceType || "shopping")) {
+    return res.status(400).json({ message: "Unknown delivery service type." });
+  }
+  if (category !== "delivery" && !String(locationLabel || "").trim()) {
+    return res.status(400).json({ message: "Please provide a service location." });
+  }
+  const supportsMultipleOrders = ["delivery", "tutoring"].includes(category);
+  if (!Number.isInteger(Number(maxSimultaneousOrders)) || Number(maxSimultaneousOrders) < 1 || Number(maxSimultaneousOrders) > (supportsMultipleOrders ? 3 : 1)) {
+    return res.status(400).json({ message: "จำนวนออร์เดอร์พร้อมกันต้องอยู่ระหว่าง 1 ถึง 3" });
+  }
+  if (!Number.isFinite(Number(fee)) || Number(fee) < 0 || category === "delivery" && Number(fee) <= 0) {
+    return res.status(400).json({ message: "ค่าจ้างต่อออร์เดอร์ฝากหิ้วต้องมากกว่า 0 บาท" });
+  }
 
   const post = await ServicePost.create({
     worker: req.user._id,
     category,
+    serviceType: category === "delivery" ? (serviceType || "shopping") : null,
     title,
+    locationLabel: String(locationLabel || "").trim(),
     description,
     fee,
     maxSimultaneousOrders,
     availabilityStart,
     availabilityEnd,
-    serviceRadiusMeters: serviceRadiusMeters || 2000,
+    serviceRadiusMeters: category === "delivery" ? (serviceRadiusMeters || 2000) : 0,
     location: { type: "Point", coordinates: [Number(lng), Number(lat)] },
   });
 
@@ -87,12 +102,18 @@ const sendServiceRequest = asyncHandler(async (req, res) => {
   if (orderData != null && (typeof orderData !== "object" || Array.isArray(orderData))) {
     return res.status(400).json({ message: "ข้อมูลคำขอไม่ถูกต้อง" });
   }
-  const fields = ["from", "to", "estimatedDelivery", "requirements"];
+  const fields = ["itemName", "from", "to", "requirements", "pickupLocation"];
   if (orderData && fields.some((field) => orderData[field] != null && (typeof orderData[field] !== "string" || orderData[field].length > 500))) {
     return res.status(400).json({ message: "ข้อมูลสถานที่/เวลา/รายละเอียดต้องเป็นข้อความไม่เกิน 500 ตัวอักษร" });
   }
   if (orderData?.itemBudget != null && (orderData.itemBudget === "" || !Number.isFinite(Number(orderData.itemBudget)) || Number(orderData.itemBudget) < 0)) {
     return res.status(400).json({ message: "งบประมาณสินค้าต้องเป็นจำนวนเงินที่ไม่ติดลบ" });
+  }
+  if (orderData?.passengerCount != null && (!Number.isInteger(Number(orderData.passengerCount)) || Number(orderData.passengerCount) < 1)) {
+    return res.status(400).json({ message: "Passenger count must be a positive whole number." });
+  }
+  if (orderData?.serviceType != null && !["shopping", "pickup_delivery", "passenger"].includes(orderData.serviceType)) {
+    return res.status(400).json({ message: "Unknown delivery service type." });
   }
   const post = await ServicePost.findById(req.params.id);
   if (!post) return res.status(404).json({ message: "ไม่พบประกาศบริการนี้" });
@@ -103,6 +124,14 @@ const sendServiceRequest = asyncHandler(async (req, res) => {
   if (post.status !== "active" || post.availabilityEnd < new Date()) {
     return res.status(400).json({ message: "ประกาศบริการนี้ปิดรับคำขอแล้ว" }); // FR-SERV-02/03
   }
+  if (post.category === "delivery") {
+    const serviceType = post.serviceType || orderData?.serviceType || "shopping";
+    const missingDetails = !orderData?.to?.trim() || (serviceType === "passenger"
+      ? !Number.isInteger(Number(orderData?.passengerCount)) || Number(orderData.passengerCount) < 1
+      : !orderData?.itemName?.trim() || !orderData?.requirements?.trim()) ||
+      (serviceType !== "shopping" && !orderData?.pickupLocation?.trim());
+    if (missingDetails) return res.status(400).json({ message: "Please provide the required details and locations for this service type." });
+  }
   if (post.currentOrderCount >= post.maxSimultaneousOrders) {
     return res.status(400).json({ message: "ประกาศบริการนี้เต็มจำนวนออร์เดอร์แล้ว" }); // FR-SERV-06
   }
@@ -112,6 +141,10 @@ const sendServiceRequest = asyncHandler(async (req, res) => {
     hirer: req.user._id,
     orderDetails: orderDetails.trim(),
     orderData: orderData ? {
+      serviceType: post.serviceType || orderData.serviceType || null,
+      itemName: (orderData.itemName || "").trim(),
+      pickupLocation: (orderData.pickupLocation || "").trim(),
+      passengerCount: orderData.passengerCount == null ? null : Number(orderData.passengerCount),
       from: (orderData.from || "").trim(),
       to: (orderData.to || "").trim(),
       estimatedDelivery: (orderData.estimatedDelivery || "").trim(),
@@ -136,7 +169,7 @@ const sendServiceRequest = asyncHandler(async (req, res) => {
 const getMyIncomingRequests = asyncHandler(async (req, res) => {
   const myPosts = await ServicePost.find({ worker: req.user._id }).select("_id");
   const requests = await ServiceRequest.find({ servicePost: { $in: myPosts.map((p) => p._id) } })
-    .populate("servicePost", "title description fee status availabilityEnd maxSimultaneousOrders currentOrderCount")
+    .populate("servicePost", "title description category serviceType fee status availabilityEnd maxSimultaneousOrders currentOrderCount")
     .populate("hirer", "fullName avatarUrl")
     .sort({ createdAt: -1 });
   res.json(requests);
@@ -148,7 +181,7 @@ const getIncomingRequestById = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: "Request ID ไม่ถูกต้อง" });
   }
   const request = await ServiceRequest.findById(req.params.id)
-    .populate("servicePost", "worker title description fee status availabilityEnd maxSimultaneousOrders currentOrderCount")
+    .populate("servicePost", "worker title description category serviceType fee status availabilityEnd maxSimultaneousOrders currentOrderCount")
     .populate("hirer", "fullName avatarUrl")
     .populate("resultingJob", "_id status price");
   if (!request || !request.servicePost) return res.status(404).json({ message: "ไม่พบคำขอนี้" });
@@ -223,7 +256,7 @@ const respondToServiceRequest = asyncHandler(async (req, res) => {
         category: post.category,
         title: post.title,
         description: request.orderDetails || post.description,
-        fromText: request.orderData?.from || post.title,
+        fromText: request.orderData?.pickupLocation || request.orderData?.from || post.title,
         toText: request.orderData?.to || "",
         notes: request.orderData?.requirements || "",
         price: post.fee, // Demo payment tracks worker fee only. Item budget is a separate estimate.
@@ -234,13 +267,17 @@ const respondToServiceRequest = asyncHandler(async (req, res) => {
         selectedWorker: post.worker,
         originServiceRequest: request._id,
       });
-      const feePercent = require('../services/paymentTerms.service').feePercent();
-      const feeAmount = Math.round(Number(post.fee) * feePercent) / 100;
+      const paymentTerms = require('../services/paymentTerms.service');
+      const feeBreakdown = paymentTerms.calculateCombinedFees(Number(post.fee), { deliveryService: post.category === "delivery" });
+      const feePercent = feeBreakdown.appPercent;
+      const fixedFee = feeBreakdown.appFixed;
+      const transactionFee = feeBreakdown.gatewayFeeAmount;
+      const feeAmount = feeBreakdown.platformFeeAmount;
       await Payment.create({
         job: job._id, hirer: request.hirer, worker: post.worker,
         amount: post.fee, platformFeePercent: feePercent,
-        platformFeeAmount: feeAmount, netAmountToWorker: post.fee,
-        status: "pending", paymentMode: "slip_demo", gatewayFeeAmount: 0,
+        platformFeeAmount: feeAmount, platformFeeFixedAmount: fixedFee, netAmountToWorker: post.fee,
+        status: "pending", paymentMode: "slip_demo", gatewayFeeAmount: transactionFee, mockGatewayFeeAmount: transactionFee, mockGatewayFeePercent: feeBreakdown.gatewayPercent, mockGatewayFeeFixedAmount: feeBreakdown.gatewayFixed,
       });
       await ServiceRequest.updateOne({ _id: request._id, status: "accepted" },
         { $set: { resultingJob: job._id } });

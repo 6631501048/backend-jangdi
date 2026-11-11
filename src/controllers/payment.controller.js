@@ -109,8 +109,8 @@ const getMockPayment = asyncHandler(async (req, res) => {
   }
   res.json({ jobId: payment.job, status: payment.status, paymentMode: payment.paymentMode || "demo",
     id: payment._id, hasStripeSession: !!payment.stripeSessionId, amount: payment.amount, platformFeeAmount: payment.platformFeeAmount,
-    platformFeePercent: payment.platformFeePercent, netAmountToWorker: payment.netAmountToWorker,
-    mockGatewayFeePercent: payment.mockGatewayFeePercent, mockGatewayFeeAmount: payment.mockGatewayFeeAmount,
+    platformFeePercent: payment.platformFeePercent, platformFeeFixedAmount: payment.platformFeeFixedAmount || 0, netAmountToWorker: payment.netAmountToWorker,
+    mockGatewayFeePercent: payment.mockGatewayFeePercent, mockGatewayFeeFixedAmount: payment.mockGatewayFeeFixedAmount, mockGatewayFeeAmount: payment.mockGatewayFeeAmount,
     payoutReference: payment.payoutReference, payoutAmount: payment.payoutAmount,
     refundReference: payment.refundReference, refundMethod: payment.refundMethod,
     stripeRefundId: payment.stripeRefundId,

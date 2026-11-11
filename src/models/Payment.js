@@ -13,6 +13,7 @@ const paymentSchema = new mongoose.Schema(
     amount: { type: Number, required: true, min: 0 }, // มูลค่างานเต็ม
     platformFeePercent: { type: Number, required: true, min: 5, max: 10 }, // FR-PAY-03
     platformFeeAmount: { type: Number, required: true },
+    platformFeeFixedAmount: { type: Number, min: 0, default: 0 },
     netAmountToWorker: { type: Number, required: true },
 
     // MVP simulation is never an actual transfer. Manual real-money flow comes after MVP.
@@ -56,6 +57,7 @@ const paymentSchema = new mongoose.Schema(
     gatewayFeeAmount: { type: Number, default: null },
     // Separate mock platform expense from any historical provider-reported fee.
     mockGatewayFeePercent: { type: Number, min: 0, max: 100, default: null },
+    mockGatewayFeeFixedAmount: { type: Number, min: 0, default: null },
     mockGatewayFeeAmount: { type: Number, min: 0, default: null },
     stripeRefundId: { type: String, default: null },
     refundStatus: { type: String, default: null },

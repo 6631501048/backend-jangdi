@@ -1,11 +1,14 @@
 // Repair only old automatic releases with no evidence of an admin payout.
-function planPaymentRepair(payment, defaultPercent) {
+function planPaymentRepair(payment, defaultPercent, defaultFixedAmount = 10) {
   const set = {};
   const mode = payment.paymentMode || 'demo';
-  if (mode === 'stripe_test' && (payment.mockGatewayFeePercent == null || payment.mockGatewayFeeAmount == null)) {
+  if (mode === 'stripe_test' && (payment.mockGatewayFeePercent == null || payment.mockGatewayFeeFixedAmount == null || payment.mockGatewayFeeAmount == null)) {
     const percent = payment.mockGatewayFeePercent ?? defaultPercent;
+    const fixed = payment.mockGatewayFeeFixedAmount ?? defaultFixedAmount;
+    const chargeAmount = Number(payment.amount || 0) + Number(payment.platformFeeAmount || 0);
     set.mockGatewayFeePercent = percent;
-    set.mockGatewayFeeAmount = Math.round(payment.amount * percent) / 100;
+    set.mockGatewayFeeFixedAmount = fixed;
+    set.mockGatewayFeeAmount = Math.round((chargeAmount * percent / 100 + fixed) * 100) / 100;
   }
   let needsReview = false;
   if (['demo','slip_demo','stripe_test'].includes(mode) && payment.status === 'released' && !payment.hasPayoutSlip) {

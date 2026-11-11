@@ -11,6 +11,10 @@ const serviceRequestSchema = new mongoose.Schema(
     orderDetails: { type: String, required: true },
     // MVP-02: ค่าในฟอร์มจริง ไม่สรุปยอดสินค้าจากข้อความด้วยการเดา
     orderData: {
+      serviceType: { type: String, enum: ["shopping", "pickup_delivery", "passenger", null], default: null },
+      itemName: { type: String, default: "" },
+      pickupLocation: { type: String, default: "" },
+      passengerCount: { type: Number, default: null, min: 1 },
       from: { type: String, default: "" },
       to: { type: String, default: "" },
       estimatedDelivery: { type: String, default: "" },

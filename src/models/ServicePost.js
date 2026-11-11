@@ -8,11 +8,13 @@ const servicePostSchema = new mongoose.Schema(
   {
     worker: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     category: { type: String, required: true, trim: true },
+    serviceType: { type: String, enum: ["shopping", "pickup_delivery", "passenger", null], default: null },
     title: { type: String, required: true, trim: true },
+    locationLabel: { type: String, default: "", trim: true },
     description: { type: String, required: true },
     fee: { type: Number, required: true, min: 0 },
 
-    maxSimultaneousOrders: { type: Number, required: true, min: 1 },
+    maxSimultaneousOrders: { type: Number, required: true, min: 1, max: 3 },
     currentOrderCount: { type: Number, default: 0 },
 
     availabilityStart: { type: Date, required: true },

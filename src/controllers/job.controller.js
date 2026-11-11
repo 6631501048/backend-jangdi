@@ -334,16 +334,20 @@ const selectWorker = asyncHandler(async (req, res) => {
         { job: job._id, worker: { $ne: workerId }, status: "waiting" },
         { $set: { status: "not_selected" } }, { session }
       );
-      // Hirer pays the transaction fee ON TOP of the job/service amount.
-      // Keep this aligned with the Post Job UI (5% of the base job wage).
       const amount = Number(job.price) + Number(job.deliveryFee || 0);
-      const feePercent = require('../services/paymentTerms.service').feePercent();
-      const feeAmount = Math.round(Number(job.price) * feePercent) / 100;
+      const paymentTerms = require('../services/paymentTerms.service');
+      const feeBreakdown = paymentTerms.calculateCombinedFees(amount);
       await Payment.create([{
         job: job._id, hirer: job.hirer, worker: workerId, amount,
-        platformFeePercent: feePercent, platformFeeAmount: feeAmount,
+        platformFeePercent: feeBreakdown.appPercent,
+        platformFeeAmount: feeBreakdown.platformFeeAmount,
+        platformFeeFixedAmount: feeBreakdown.appFixed,
         netAmountToWorker: amount,
-        status: "pending", paymentMode: "slip_demo", gatewayFeeAmount: 0,
+        status: "pending", paymentMode: "slip_demo",
+        gatewayFeeAmount: feeBreakdown.gatewayFeeAmount,
+        mockGatewayFeeAmount: feeBreakdown.gatewayFeeAmount,
+        mockGatewayFeePercent: feeBreakdown.gatewayPercent,
+        mockGatewayFeeFixedAmount: feeBreakdown.gatewayFixed,
       }], { session });
       await logJobStatusChange({
         jobId: job._id, previousStatus: "waiting", newStatus: "assigned",

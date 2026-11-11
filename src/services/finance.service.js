@@ -35,7 +35,7 @@ function overview(payments, isHirer, window) {
     lifetime: { total: sum(isHirer ? valid : payments.filter(paidToWorker), amount),
       ...Object.fromEntries(['pending','awaiting_verification','slip_rejected','held','payout_pending','disputed','refund_pending','refunded'].map(status => [status, sum(payments.filter(p => p.status === status), p => status === 'refunded' && isHirer ? (p.refundAmount ?? paidTotal(p)) : amount(p))])) },
     period: { total: sum(isHirer ? periodPaid : received, amount), completedJobs: completed.length, fees: sum(isHirer ? periodPaid : received, p => isHirer ? p.platformFeeAmount : Math.max(0, p.amount - p.netAmountToWorker)) },
-    transactions: payments.filter(p => window.includes(p.createdAt)).map(p => ({ id:p._id, jobId:p.job?._id || p.job, jobTitle:p.job?.title || 'งานถูกลบ', amount:amount(p), date:p.createdAt, paidAt:p.paidAt, status:p.status, paymentMode:p.paymentMode || 'demo', hasInboundSlip:isHirer && p.hasInboundSlip, hasPayoutSlip:p.hasPayoutSlip, hasRefundSlip:isHirer && p.hasRefundSlip })),
+    transactions: (isHirer ? periodPaid : received).map(p => ({ id:p._id, jobId:p.job?._id || p.job, jobTitle:p.job?._id ? p.job.title : 'งานถูกลบ', amount:amount(p), date:isHirer ? p.heldAt : p.paidAt, paidAt:p.paidAt, status:p.status, paymentMode:p.paymentMode || 'demo', hasInboundSlip:isHirer && p.hasInboundSlip, hasPayoutSlip:p.hasPayoutSlip, hasRefundSlip:isHirer && p.hasRefundSlip })),
   };
 }
 function financials(payments, window) {
