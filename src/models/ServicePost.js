@@ -29,10 +29,11 @@ const servicePostSchema = new mongoose.Schema(
     // FR-SERV-02 / FR-SERV-03 / FR-SERV-06
     status: {
       type: String,
-      enum: ["active", "closed", "expired"],
-      default: "active",
+      enum: ["pending_review", "active", "rejected", "closed", "expired"],
+      default: "pending_review",
     },
     closeReason: { type: String, enum: ["manual", "capacity", null], default: null },
+    rejectionReason: { type: String, default: null },
   },
   { timestamps: true }
 );

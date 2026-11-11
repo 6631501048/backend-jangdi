@@ -20,7 +20,13 @@ const getServicePosts = asyncHandler(async (req, res) => {
 
 /** GET /api/service-posts/:id */
 const getServicePostById = asyncHandler(async (req, res) => {
-  const post = await ServicePost.findById(req.params.id).populate("worker", "fullName avatarUrl credibilityScore");
+  // Keep unpublished, rejected, closed and expired listings private. Public
+  // detail links must follow the same visibility rule as the service feed.
+  const post = await ServicePost.findOne({
+    _id: req.params.id,
+    status: "active",
+    availabilityEnd: { $gte: new Date() },
+  }).populate("worker", "fullName avatarUrl credibilityScore");
   if (!post) return res.status(404).json({ message: "ไม่พบประกาศบริการนี้" });
   res.json(post);
 });
@@ -45,8 +51,7 @@ const createServicePost = asyncHandler(async (req, res) => {
   if (category !== "delivery" && !String(locationLabel || "").trim()) {
     return res.status(400).json({ message: "Please provide a service location." });
   }
-  const supportsMultipleOrders = ["delivery", "tutoring"].includes(category);
-  if (!Number.isInteger(Number(maxSimultaneousOrders)) || Number(maxSimultaneousOrders) < 1 || Number(maxSimultaneousOrders) > (supportsMultipleOrders ? 3 : 1)) {
+  if (!Number.isInteger(Number(maxSimultaneousOrders)) || Number(maxSimultaneousOrders) < 1 || Number(maxSimultaneousOrders) > 3) {
     return res.status(400).json({ message: "จำนวนออร์เดอร์พร้อมกันต้องอยู่ระหว่าง 1 ถึง 3" });
   }
   if (!Number.isFinite(Number(fee)) || Number(fee) < 0 || category === "delivery" && Number(fee) <= 0) {
@@ -66,9 +71,10 @@ const createServicePost = asyncHandler(async (req, res) => {
     availabilityEnd,
     serviceRadiusMeters: category === "delivery" ? (serviceRadiusMeters || 2000) : 0,
     location: { type: "Point", coordinates: [Number(lng), Number(lat)] },
+    status: "pending_review",
   });
 
-  res.status(201).json({ message: "สร้างประกาศบริการสำเร็จ", post });
+  res.status(201).json({ message: "ส่งประกาศบริการแล้ว รอผู้ดูแลตรวจสอบ", post });
 });
 
 /** GET /api/service-posts/my — ประกาศบริการของ worker ปัจจุบัน */
@@ -136,6 +142,11 @@ const sendServiceRequest = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: "ประกาศบริการนี้เต็มจำนวนออร์เดอร์แล้ว" }); // FR-SERV-06
   }
 
+  const existingPending = await ServiceRequest.findOne({ servicePost: post._id, hirer: req.user._id, status: "pending" }).select("_id");
+  if (existingPending) {
+    return res.status(409).json({ message: "คุณส่งคำขอบริการนี้แล้ว กำลังรอผู้รับจ้างตอบรับ" });
+  }
+
   const request = await ServiceRequest.create({
     servicePost: post._id,
     hirer: req.user._id,
@@ -171,6 +182,15 @@ const getMyIncomingRequests = asyncHandler(async (req, res) => {
   const requests = await ServiceRequest.find({ servicePost: { $in: myPosts.map((p) => p._id) } })
     .populate("servicePost", "title description category serviceType fee status availabilityEnd maxSimultaneousOrders currentOrderCount")
     .populate("hirer", "fullName avatarUrl")
+    .sort({ createdAt: -1 });
+  res.json(requests);
+});
+
+/** GET /api/service-posts/requests/my-as-hirer — Hirer's own requests and accepted jobs. */
+const getMyOutgoingRequests = asyncHandler(async (req, res) => {
+  const requests = await ServiceRequest.find({ hirer: req.user._id })
+    .populate("servicePost", "title status")
+    .populate("resultingJob", "_id status")
     .sort({ createdAt: -1 });
   res.json(requests);
 });
@@ -302,20 +322,21 @@ const respondToServiceRequest = asyncHandler(async (req, res) => {
     }
   }
 
+  const updated = await ServiceRequest.findById(request._id);
+  const acceptedJobId = action === "accept" ? updated?.resultingJob : null;
   await notifyUser(req.app.get("io"), {
     userId: request.hirer,
-    type: "application_update",
-    title: action === "accept" ? "คำขอบริการของคุณได้รับการยอมรับ" : "คำขอบริการของคุณถูกปฏิเสธ",
+    type: action === "accept" ? "payment_update" : "application_update",
+    title: action === "accept" ? "ผู้รับจ้างรับคำขอแล้ว กรุณาชำระเงิน" : "คำขอบริการของคุณถูกปฏิเสธ",
     message: request.servicePost.title,
-    relatedEntityType: "ServiceRequest",
-    relatedEntityId: request._id,
+    relatedEntityType: acceptedJobId ? "Job" : "ServiceRequest",
+    relatedEntityId: acceptedJobId || request._id,
   });
 
-  const updated = await ServiceRequest.findById(request._id);
   res.json({ message: `${action === "accept" ? "ยอมรับ" : "ปฏิเสธ"}คำขอสำเร็จ`, request: updated });
 });
 
 module.exports = {
   getServicePosts, getServicePostById, createServicePost, getMyServicePosts, closeServicePost,
-  sendServiceRequest, getMyIncomingRequests, getIncomingRequestById, respondToServiceRequest,
+  sendServiceRequest, getMyIncomingRequests, getMyOutgoingRequests, getIncomingRequestById, respondToServiceRequest,
 };

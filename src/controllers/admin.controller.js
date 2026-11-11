@@ -62,7 +62,7 @@ const getAllJobs = asyncHandler(async (req, res) => {
 
 /** GET /api/admin/service-posts — read-only overview of Worker service listings */
 const getAllServicePosts = asyncHandler(async (req, res) => {
-  const allowed = ["all", "active", "closed", "expired"];
+  const allowed = ["all", "pending_review", "active", "rejected", "closed", "expired"];
   const status = String(req.query.status || "all");
   if (!allowed.includes(status)) return res.status(400).json({ message: "สถานะประกาศบริการไม่ถูกต้อง" });
   const rawPage = req.query.page == null ? "1" : String(req.query.page);
@@ -78,11 +78,63 @@ const getAllServicePosts = asyncHandler(async (req, res) => {
     filter.$or = [{ title: { $regex: escaped, $options: "i" } }, { description: { $regex: escaped, $options: "i" } }];
   }
   const [posts, total] = await Promise.all([
-    ServicePost.find(filter).select("worker title description category fee status availabilityEnd createdAt currentOrderCount maxSimultaneousOrders")
+    ServicePost.find(filter).select("worker title description category fee status rejectionReason availabilityEnd createdAt currentOrderCount maxSimultaneousOrders")
       .populate("worker", "fullName email").sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit),
     ServicePost.countDocuments(filter),
   ]);
   res.json({ posts, total, page, limit, totalPages: Math.ceil(total / limit) });
+});
+
+/** POST /api/admin/service-posts/:id/approve — publish a Worker service listing after review. */
+const approveServicePost = asyncHandler(async (req, res) => {
+  if (!validId(req.params.id)) return res.status(400).json({ message: "Service Post ID ไม่ถูกต้อง" });
+  const post = await ServicePost.findOneAndUpdate(
+    { _id: req.params.id, status: "pending_review", availabilityEnd: { $gt: new Date() } },
+    { $set: { status: "active", rejectionReason: null } },
+    { new: true, runValidators: true }
+  );
+  if (!post) {
+    const current = await ServicePost.findById(req.params.id);
+    return current
+      ? res.status(409).json({ message: current.status === "pending_review" ? "ประกาศบริการหมดเวลาแล้ว" : `ประกาศนี้มีสถานะ ${current.status} ไม่สามารถอนุมัติได้` })
+      : res.status(404).json({ message: "ไม่พบประกาศบริการนี้" });
+  }
+  try {
+    await notifyUser(req.app.get("io"), {
+      userId: post.worker, type: "system", title: "ประกาศบริการได้รับการอนุมัติแล้ว",
+      message: `ประกาศ “${post.title}” เปิดให้ผู้ว่าจ้างส่งคำขอได้แล้ว`,
+      relatedEntityType: "ServicePost", relatedEntityId: post._id,
+    });
+  } catch (err) { console.error("Admin service post approval notification failed:", err); }
+  res.json({ message: "อนุมัติประกาศบริการสำเร็จ", post });
+});
+
+/** POST /api/admin/service-posts/:id/reject — reject a Worker service listing. */
+const rejectServicePost = asyncHandler(async (req, res) => {
+  if (!validId(req.params.id)) return res.status(400).json({ message: "Service Post ID ไม่ถูกต้อง" });
+  if (req.body?.reason !== undefined && typeof req.body.reason !== "string") {
+    return res.status(400).json({ message: "reason ต้องเป็นข้อความ" });
+  }
+  const reason = String(req.body?.reason || "").trim() || "ไม่ผ่านการตรวจสอบโดยผู้ดูแลระบบ";
+  if (reason.length > 500) return res.status(400).json({ message: "เหตุผลต้องไม่เกิน 500 ตัวอักษร" });
+  const post = await ServicePost.findOneAndUpdate(
+    { _id: req.params.id, status: "pending_review" },
+    { $set: { status: "rejected", rejectionReason: reason } },
+    { new: true, runValidators: true }
+  );
+  if (!post) {
+    const current = await ServicePost.findById(req.params.id);
+    return current
+      ? res.status(409).json({ message: `ประกาศนี้มีสถานะ ${current.status} ไม่สามารถปฏิเสธได้` })
+      : res.status(404).json({ message: "ไม่พบประกาศบริการนี้" });
+  }
+  try {
+    await notifyUser(req.app.get("io"), {
+      userId: post.worker, type: "system", title: "ประกาศบริการไม่ผ่านการอนุมัติ",
+      message: reason, relatedEntityType: "ServicePost", relatedEntityId: post._id,
+    });
+  } catch (err) { console.error("Admin service post rejection notification failed:", err); }
+  res.json({ message: "ปฏิเสธประกาศบริการสำเร็จ", post });
 });
 
 /**
@@ -373,7 +425,7 @@ const resolveSos = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
-  getPendingJobs, getAllJobs, getAllServicePosts, approveJob, rejectJob,
+  getPendingJobs, getAllJobs, getAllServicePosts, approveJob, rejectJob, approveServicePost, rejectServicePost,
   getDashboard, getUsers, updateUserStatus,
   getEscrowPayments, decideRefund,
   getReports, resolveReport,
