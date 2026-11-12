@@ -32,7 +32,7 @@ const servicePostSchema = new mongoose.Schema(
       enum: ["pending_review", "active", "rejected", "closed", "expired"],
       default: "pending_review",
     },
-    closeReason: { type: String, enum: ["manual", "capacity", null], default: null },
+    closeReason: { type: String, enum: ["manual", "capacity", "refund", null], default: null },
     closeNote: { type: String, default: "", trim: true, maxlength: 500 },
     rejectionReason: { type: String, default: null },
   },

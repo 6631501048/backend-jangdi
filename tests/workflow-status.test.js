@@ -1,10 +1,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const id = '507f1f77bcf86cd799439011';
-let payment, job, requests, stripeCalls, postState;
+let payment, job, requests, stripeCalls, postState, otherJobs;
 const clone = value => value == null ? value : structuredClone(value);
 function matches(record, query) {
   return record && Object.entries(query).every(([key, value]) => {
+    if (key === '$or') return value.some(condition => matches(record, condition));
     if (value && typeof value === 'object' && '$ne' in value) return record[key] !== value.$ne;
     if (value && typeof value === 'object' && '$gt' in value) return record[key] > value.$gt;
     if (value?.$in) return value.$in.map(String).includes(String(record[key]));
@@ -36,7 +37,7 @@ stub('../src/models', {
   },
   Job: {
     findOne: query => chain(() => matches(job, query) ? job : null),
-    find: query => chain(() => job && matches(job, query) ? [job] : []),
+    find: query => chain(() => [job, ...otherJobs].filter(record => matches(record, query))),
     findById: () => chain(() => job),
     findOneAndUpdate: async (...args) => update('job', ...args),
     updateOne: async (...args) => ({ matchedCount: update('job', ...args) ? 1 : 0 }),
@@ -68,7 +69,7 @@ function reset(status = 'refunded', mode = 'stripe_test') {
     refundDecision: status === 'disputed' ? null : 'approved', amount: 100, platformFeeAmount: 5, stripeRefundId: null };
   job = { _id: id, hirer: 'hirer1', selectedWorker: 'worker1', status: 'disputed' };
   requests = [{ _id: 'request1', status: 'accepted', servicePost: { _id: 'post1', worker: 'worker1' }, resultingJob: { _id: id, status: 'disputed' } }];
-  stripeCalls = 0;
+  stripeCalls = 0; otherJobs = [];
   postState = { _id: 'post1', status: 'closed', closeReason: 'capacity', currentOrderCount: 1, availabilityEnd: new Date('2099-01-01') };
 }
 function invoke(handler, overrides = {}) {
@@ -170,7 +171,28 @@ test('only admin can approve and record a return; proof finalizes payment/job an
     const returned = await postProof();
     assert.equal(returned.status, 200, await returned.text());
     assert.equal(payment.status, 'refunded'); assert.equal(payment.hasRefundSlip, true); assert.equal(payment.refundReference, 'BANKREF001');
-    assert.equal(job.status, 'cancelled'); assert.equal(postState.currentOrderCount, 0); assert.equal(postState.status, 'active');
+    assert.equal(job.status, 'cancelled'); assert.equal(postState.currentOrderCount, 0); assert.equal(postState.status, 'closed'); assert.equal(postState.closeReason, 'refund');
     assert.equal((await postProof()).status, 409); assert.equal(postState.currentOrderCount, 0); assert.equal(stripeCalls, 0);
   }
+});
+
+test('refund closes a listing even if it was active or its counter was already zero', async () => {
+  const { presentServiceCapacity } = require('../src/services/serviceCapacity.service');
+  for (const counter of [0, 1]) {
+    reset('refund_pending'); job.originServiceRequest = 'request1';
+    postState.status = 'active'; postState.currentOrderCount = counter;
+    await refunds.completeRefund(id, null);
+    assert.equal(postState.status, 'closed'); assert.equal(postState.closeReason, 'refund');
+    assert.equal(postState.currentOrderCount, 0);
+    assert.equal(presentServiceCapacity(postState, 0).status, 'closed');
+  }
+});
+test('a refund closes new hiring while keeping other accepted orders intact', async () => {
+  reset('refund_pending'); job.originServiceRequest = 'request1';
+  otherJobs = [{ _id: 'job2', status: 'in_progress', originServiceRequest: 'request2' }];
+  requests.push({ _id: 'request2', status: 'accepted', servicePost: { _id: 'post1' }, resultingJob: { _id: 'job2', status: 'in_progress' } });
+  postState.status = 'active'; postState.maxSimultaneousOrders = 3; postState.currentOrderCount = 2;
+  await refunds.completeRefund(id, null);
+  assert.equal(postState.status, 'closed'); assert.equal(postState.closeReason, 'refund');
+  assert.equal(postState.currentOrderCount, 1); assert.equal(otherJobs[0].status, 'in_progress');
 });

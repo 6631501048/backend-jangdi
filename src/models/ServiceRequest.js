@@ -28,6 +28,7 @@ const serviceRequestSchema = new mongoose.Schema(
       enum: ["pending", "accepted", "declined"],
       default: "pending",
     },
+    declineReason: { type: String, enum: ['worker_declined', 'capacity', 'refund', 'post_closed', 'expired', null], default: null },
     respondedAt: { type: Date, default: null },
 
     // เมื่อ accepted แล้วจะสร้าง Job และเก็บ reference ไว้ที่นี่ด้วย

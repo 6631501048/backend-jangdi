@@ -1,3 +1,5 @@
+const { closeUnselectedRequests } = require('../services/serviceRequestOutcome.service');
+const { getActiveServiceOrderCounts } = require('../services/serviceCapacity.service');
 const asyncHandler = require('express-async-handler');
 const multer = require('multer');
 const mongoose = require('mongoose');
@@ -49,10 +51,15 @@ async function completeRefund(paymentId, refund, existingSession) {
       if (job.originServiceRequest) {
         const origin = await ServiceRequest.findById(job.originServiceRequest).session(session);
         const post = origin?.servicePost ? await ServicePost.findById(origin.servicePost).session(session) : null;
-        if (post?.currentOrderCount > 0) {
-          const change = {$inc:{currentOrderCount:-1}};
-          if (post.status === 'closed' && post.closeReason === 'capacity' && post.availabilityEnd > new Date()) change.$set = {status:'active',closeReason:null};
-          await ServicePost.updateOne({_id:post._id,currentOrderCount:{$gt:0}},change,{session});
+        if (post) {
+          const counts = await getActiveServiceOrderCounts([post._id], session);
+          // A refunded order closes the listing to new work. Other accepted
+          // orders remain intact and may finish, but must not reopen this post.
+          await ServicePost.updateOne({ _id: post._id }, { $set: {
+            currentOrderCount: counts.get(String(post._id)) || 0,
+            status: 'closed', closeReason: 'refund',
+          } }, { session, runValidators: true });
+          await closeUnselectedRequests(post._id, 'refund', session);
         }
       }
     }

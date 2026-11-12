@@ -9,9 +9,9 @@ async function getActiveServiceOrderCounts(postIds, session = null) {
   const requests = await ServiceRequest.find({ servicePost: { $in: postIds } })
     .select('_id servicePost resultingJob').session(session).lean();
   if (!requests.length) return counts;
-  const byRequest = new Map(requests.map(request => [String(request._id), String(request.servicePost)]));
+  const byRequest = new Map(requests.map(request => [String(request._id), String(request.servicePost?._id || request.servicePost)]));
   const byJob = new Map(requests.filter(request => request.resultingJob)
-    .map(request => [String(request.resultingJob), String(request.servicePost)]));
+    .map(request => [String(request.resultingJob?._id || request.resultingJob), String(request.servicePost?._id || request.servicePost)]));
   const jobs = await Job.find({
     status: { $in: ACTIVE_STATUSES },
     $or: [{ originServiceRequest: { $in: requests.map(request => request._id) } }, { _id: { $in: [...byJob.keys()] } }],

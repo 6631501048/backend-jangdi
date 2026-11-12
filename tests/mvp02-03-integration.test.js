@@ -21,13 +21,17 @@ function reset() {
   db.posts = [{_id:id.post,worker:id.worker,category:"delivery",title:"Deliver package",description:"Please pick up package",fee:35,
     currentOrderCount:0,maxSimultaneousOrders:1,availabilityEnd:new Date(Date.now()+86400000),status:"active",
     location:{type:"Point",coordinates:[99.88,20.04]},createdAt:new Date()}];
+  db.failOutcomeNotification=false;
   db.failJobCreate=false;db.failPaymentCreate=false;
   db.requests = [];
   db.jobs=[]; db.payments=[]; db.feedback=[];db.events=[];
 }
 reset();
 function chain(value) {
-  return { session(){return this;},select(){return this;},lean(){return this;},populate(){return this;},sort(){return this;},skip(){return this;},limit(){return this;},
+  return { session(){return this;},select(){return this;},lean(){return this;},populate(field){
+    if(Array.isArray(value))value=value.map(row=>field==='servicePost'?{...row,servicePost:db.posts.find(post=>String(post._id)===String(row.servicePost))||null}:field==='resultingJob'?{...row,resultingJob:db.jobs.find(job=>String(job._id)===String(row.resultingJob))||null}:row);
+    return this;
+  },sort(){return this;},skip(){return this;},limit(){return this;},
     then(resolve,reject){return Promise.resolve(value).then(resolve,reject);} };
 }
 function match(document, query) {
@@ -56,6 +60,7 @@ const models = {
     countDocuments:async f=>db.posts.filter(x=>match(x,f)).length,
   },
   ServiceRequest:{
+    updateMany:async(f,p)=>{const rows=db.requests.filter(row=>match(row,f));rows.forEach(row=>update(row,p));return {modifiedCount:rows.length};},
     findOne:filter=>chain(db.requests.find(row=>match(row,filter))||null),
     findById:x=>{
       const original=db.requests.find(y=>String(y._id)===String(x));
@@ -100,7 +105,7 @@ stub('../src/services/transaction.service',{withTransaction:work=>{
   transactionQueue=transaction.catch(()=>{});return transaction;
 }});
 stub("../src/services/jobLog.service",{logJobStatusChange:async()=>{}});
-stub("../src/services/notification.service",{notifyUser:async(_io,d)=>db.events.push(d)});
+stub("../src/services/notification.service",{notifyUser:async(_io,d)=>db.events.push(d),createNotification:async d=>{if(db.failOutcomeNotification)throw new Error('outcome notification unavailable');db.events.push(d);return d;}});
 stub("../src/services/matching.service",{notifyNearbyWorkers:async()=>{}});
 process.env.JWT_SECRET="mvp-02-03-test-secret";
 const app=express(); app.use(express.json());
@@ -208,7 +213,7 @@ test('capacity one rejects a second distinct pending request after accepting the
   assert.equal((await acceptRequest(db.requests[0])).status,200);
   assert.equal((await acceptRequest(db.requests[1])).status,409);
   assert.equal(db.posts[0].currentOrderCount,1);assert.equal(db.posts[0].maxSimultaneousOrders,1);
-  assert.equal(db.requests[1].status,'pending');assert.equal(db.jobs.length,1);assert.equal(db.payments.length,1);
+  assert.equal(db.requests[1].status,'declined');assert.equal(db.requests[1].declineReason,'capacity');assert.equal(db.jobs.length,1);assert.equal(db.payments.length,1);
 });
 test('different requests racing for the same post cannot exceed capacity one, two or three',async()=>{
   for(const limit of [1,2,3]){
@@ -221,13 +226,15 @@ test('different requests racing for the same post cannot exceed capacity one, tw
     assert.equal(db.posts[0].status,'closed');
   }
 });
-test('concurrent means a finished job releases the slot for the next pending request',async()=>{
+test('a finished job releases capacity for new requests without reviving declined requests',async()=>{
   reset();pendingRequests(2);
   assert.equal((await acceptRequest(db.requests[0])).status,200);
   assert.equal((await acceptRequest(db.requests[1])).status,409);
   // Match the committed slot release from confirmCompletion/completeRefund.
   db.jobs[0].status='completed';db.posts[0].currentOrderCount=0;db.posts[0].status='active';db.posts[0].closeReason=null;
-  assert.equal((await acceptRequest(db.requests[1])).status,200);
+  assert.equal((await acceptRequest(db.requests[1])).status,409);
+  pendingRequests(1);db.requests[2]._id='507f1f77bcf86cd799439999';
+  assert.equal((await acceptRequest(db.requests[2])).status,200);
   assert.equal(db.posts[0].currentOrderCount,1);
   assert.equal(db.jobs.filter(job=>job.status==='assigned').length,1);
 });
@@ -248,7 +255,7 @@ test('failed job or payment creation releases only its reserved slot and leaves 
 test('a stale zero counter cannot allow a second active order at capacity one',async()=>{
   reset();pendingRequests(2);
   assert.equal((await acceptRequest(db.requests[0])).status,200);
-  db.posts[0].currentOrderCount=0;db.posts[0].status='active';db.posts[0].closeReason=null;
+  db.posts[0].currentOrderCount=0;db.posts[0].status='active';db.posts[0].closeReason=null;db.requests[1].status='pending';
   const response=await acceptRequest(db.requests[1]);
   assert.equal(response.status,409);assert.ok(response.data.message.includes('สูงสุด 1 งาน'));
   assert.equal(db.jobs.length,1);assert.equal(db.requests[1].status,'pending');
@@ -282,4 +289,55 @@ test('a stale full counter can be reconciled when there is no active work, while
   assert.equal(db.posts[0].currentOrderCount,1);assert.equal(db.jobs.length,1);
   reset();pendingRequests(1);db.posts[0].status='closed';db.posts[0].closeReason='manual';
   assert.equal((await acceptRequest(db.requests[0])).status,409);assert.equal(db.jobs.length,0);
+});
+
+test('refund-closed service posts reject new accept attempts even when no slot is occupied',async()=>{
+  reset();pendingRequests(1);db.posts[0].status='closed';db.posts[0].closeReason='refund';
+  assert.equal((await acceptRequest(db.requests[0])).status,409);
+  assert.equal(db.jobs.length,0);assert.equal(db.posts[0].status,'closed');
+  const listed=await req('GET','/api/service-posts/my',{user:id.worker});
+  assert.equal(listed.data[0].status,'closed');assert.equal(listed.data[0].closeReason,'refund');
+});
+
+test('when the last slot is filled every unselected hirer keeps a declined outcome and notification',async()=>{
+  reset();pendingRequests(3);
+  const selected=db.requests[0]._id;
+  assert.equal((await acceptRequest(db.requests[0])).status,200);
+  assert.equal(db.requests[0].status,'accepted');
+  for(const remaining of db.requests.slice(1)){
+    assert.equal(remaining.status,'declined');assert.equal(remaining.declineReason,'capacity');assert.ok(remaining.respondedAt);
+    assert.ok(db.events.some(event=>event.relatedEntityType==='ServiceRequestResult' && event.relatedEntityId===remaining._id));
+  }
+  assert.equal(db.jobs.length,1);assert.equal(db.requests[0]._id,selected);
+});
+test('a request remains pending while there are still free slots',async()=>{
+  reset();db.posts[0].maxSimultaneousOrders=2;pendingRequests(3);
+  await acceptRequest(db.requests[0]);
+  assert.equal(db.requests[1].status,'pending');assert.equal(db.requests[2].status,'pending');
+  await acceptRequest(db.requests[1]);
+  assert.equal(db.requests[2].status,'declined');assert.equal(db.requests[2].declineReason,'capacity');
+});
+
+test('hirer history retains unselected requests after the public post closes and exposes only that hirer',async()=>{
+  reset();pendingRequests(2);await acceptRequest(db.requests[0]);
+  const history=await req('GET','/api/service-posts/requests/my-as-hirer',{user:id.hirer});
+  assert.equal(history.status,200);assert.equal(history.data.length,2);
+  const declined=history.data.find(request=>request.status==='declined');
+  assert.equal(declined.declineReason,'capacity');assert.equal(declined.servicePost.title,'Deliver package');
+  const other='507f1f77bcf86cd799439888';db.users[other]={...db.users[id.hirer],_id:other};
+  assert.equal((await req('GET','/api/service-posts/requests/my-as-hirer',{user:other})).data.length,0);
+});
+test('outcome persistence and notification failures roll back the selection and allow a clean retry',async()=>{
+  reset();pendingRequests(2);db.failOutcomeNotification=true;
+  assert.equal((await acceptRequest(db.requests[0])).status,500);
+  assert.equal(db.jobs.length,0);assert.equal(db.posts[0].currentOrderCount,0);
+  assert.ok(db.requests.every(request=>request.status==='pending'));assert.equal(db.events.length,0);
+  db.failOutcomeNotification=false;
+  assert.equal((await acceptRequest(db.requests[0])).status,200);
+  assert.equal(db.events.filter(event=>event.relatedEntityType==='ServiceRequestResult').length,1);
+});
+test('legacy pending requests on closed posts have a visible outcome without exposing a public listing',async()=>{
+  reset();pendingRequests(1);db.posts[0].status='closed';db.posts[0].closeReason='capacity';
+  const history=await req('GET','/api/service-posts/requests/my-as-hirer',{user:id.hirer});
+  assert.equal(history.data[0].status,'declined');assert.equal(history.data[0].declineReason,'capacity');
 });

@@ -1,3 +1,4 @@
+const { closeUnselectedRequests, presentServiceRequestOutcome } = require('../services/serviceRequestOutcome.service');
 const { getActiveServiceOrderCounts, presentServiceCapacity } = require('../services/serviceCapacity.service');
 const { withTransaction } = require('../services/transaction.service');
 const { withRequestPaymentStates } = require('../services/workflowStatus.service');
@@ -230,10 +231,10 @@ const getMyIncomingRequests = asyncHandler(async (req, res) => {
 /** GET /api/service-posts/requests/my-as-hirer — Hirer's own requests and accepted jobs. */
 const getMyOutgoingRequests = asyncHandler(async (req, res) => {
   const requests = await ServiceRequest.find({ hirer: req.user._id })
-    .populate("servicePost", "title status")
+    .populate("servicePost", "title status closeReason availabilityEnd fee category")
     .populate("resultingJob", "_id status")
     .sort({ createdAt: -1 });
-  res.json(await withRequestPaymentStates(requests));
+  res.json((await withRequestPaymentStates(requests)).map(presentServiceRequestOutcome));
 });
 
 /** GET /api/service-posts/requests/:id — เจ้าของประกาศเท่านั้น */
@@ -277,7 +278,7 @@ const respondToServiceRequest = asyncHandler(async (req, res) => {
   const conflict = message => Object.assign(new Error(message), { statusCode: 409 });
   if (action === 'decline') {
     const declined = await ServiceRequest.findOneAndUpdate({ _id: request._id, status: 'pending' },
-      { $set: { status: 'declined', respondedAt: new Date() } }, { new: true, runValidators: true });
+      { $set: { status: 'declined', declineReason: 'worker_declined', respondedAt: new Date() } }, { new: true, runValidators: true });
     if (!declined) throw conflict('คำขอนี้ได้รับการตอบรับไปแล้ว');
   } else {
     await withTransaction(async session => {
@@ -319,6 +320,7 @@ const respondToServiceRequest = asyncHandler(async (req, res) => {
       await ServicePost.updateOne({ _id: post._id }, { $set: {
         currentOrderCount: nextCount, status: nextCount >= limit ? 'closed' : 'active', closeReason: nextCount >= limit ? 'capacity' : null,
       } }, { session });
+      if (nextCount >= limit) await closeUnselectedRequests(post._id, 'capacity', session);
       await logJobStatusChange({ jobId: job._id, previousStatus: null, newStatus: 'assigned', changedBy: req.user._id,
         note: `แปลงมาจาก Service Request ${request._id}`, session });
     });
@@ -331,7 +333,7 @@ const respondToServiceRequest = asyncHandler(async (req, res) => {
     type: action === "accept" ? "payment_update" : "application_update",
     title: action === "accept" ? "ผู้รับจ้างรับคำขอแล้ว กรุณาชำระเงิน" : "คำขอบริการของคุณถูกปฏิเสธ",
     message: request.servicePost.title,
-    relatedEntityType: acceptedJobId ? "Job" : "ServiceRequest",
+    relatedEntityType: acceptedJobId ? "Job" : "ServiceRequestResult",
     relatedEntityId: acceptedJobId || request._id,
   });
 
