@@ -1,3 +1,6 @@
+const { getActiveServiceOrderCounts, presentServiceCapacity } = require('../services/serviceCapacity.service');
+const { withTransaction } = require('../services/transaction.service');
+const { withRequestPaymentStates } = require('../services/workflowStatus.service');
 const asyncHandler = require("express-async-handler");
 const { ServicePost, ServiceRequest, Job, Payment } = require("../models");
 const { logJobStatusChange } = require("../services/jobLog.service");
@@ -27,13 +30,13 @@ const getServicePosts = asyncHandler(async (req, res) => {
     .populate("resultingJob", "status")
     .select("servicePost status resultingJob");
   const requestStates = new Map();
-  for (const request of requests) {
+  for (const request of await withRequestPaymentStates(requests)) {
     const key = String(request.servicePost);
     const state = requestStates.get(key) || { pending: false, inProgress: false, completed: false };
     if (request.status === "pending") state.pending = true;
     const jobStatus = request.resultingJob?.status;
-    if (["assigned", "in_progress", "awaiting_confirmation"].includes(jobStatus)) state.inProgress = true;
-    if (jobStatus === "completed") state.completed = true;
+    if (["assigned", "in_progress", "awaiting_confirmation", "disputed"].includes(jobStatus)) state.inProgress = true;
+    if (["completed", "cancelled"].includes(jobStatus)) state.completed = true;
     requestStates.set(key, state);
   }
   const visiblePosts = posts.filter((post) => {
@@ -105,7 +108,8 @@ const createServicePost = asyncHandler(async (req, res) => {
 /** GET /api/service-posts/my — ประกาศบริการของ worker ปัจจุบัน */
 const getMyServicePosts = asyncHandler(async (req, res) => {
   const posts = await ServicePost.find({ worker: req.user._id }).sort({ createdAt: -1 });
-  res.json(posts);
+  const counts = await getActiveServiceOrderCounts(posts.map(post => post._id));
+  res.json(posts.map(post => presentServiceCapacity(post, counts.get(String(post._id)))));
 });
 
 /** POST /api/service-posts/:id/close — FR-SERV-03 */
@@ -216,18 +220,11 @@ const sendServiceRequest = asyncHandler(async (req, res) => {
 const getMyIncomingRequests = asyncHandler(async (req, res) => {
   const myPosts = await ServicePost.find({ worker: req.user._id }).select("_id");
   const requests = await ServiceRequest.find({ servicePost: { $in: myPosts.map((p) => p._id) } })
-    .populate("servicePost", "title description category serviceType fee status availabilityEnd maxSimultaneousOrders currentOrderCount")
+    .populate("servicePost", "title description category serviceType fee status availabilityEnd maxSimultaneousOrders currentOrderCount closeReason")
     .populate("hirer", "fullName avatarUrl")
     .populate("resultingJob", "_id status")
     .sort({ createdAt: -1 });
-  const resultingJobIds = requests.map((request) => request.resultingJob?._id).filter(Boolean);
-  const refundedPayments = await Payment.find({ worker: req.user._id, job: { $in: resultingJobIds }, status: "refunded" }).select("job").lean();
-  const refundedJobIds = new Set(refundedPayments.map((payment) => String(payment.job)));
-  res.json(requests.map((request) => {
-    const result = request.toObject();
-    if (result.resultingJob && refundedJobIds.has(String(result.resultingJob._id))) result.resultingJob.status = "cancelled";
-    return result;
-  }));
+  res.json(await withRequestPaymentStates(requests));
 });
 
 /** GET /api/service-posts/requests/my-as-hirer — Hirer's own requests and accepted jobs. */
@@ -236,7 +233,7 @@ const getMyOutgoingRequests = asyncHandler(async (req, res) => {
     .populate("servicePost", "title status")
     .populate("resultingJob", "_id status")
     .sort({ createdAt: -1 });
-  res.json(requests);
+  res.json(await withRequestPaymentStates(requests));
 });
 
 /** GET /api/service-posts/requests/:id — เจ้าของประกาศเท่านั้น */
@@ -245,14 +242,17 @@ const getIncomingRequestById = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: "Request ID ไม่ถูกต้อง" });
   }
   const request = await ServiceRequest.findById(req.params.id)
-    .populate("servicePost", "worker title description category serviceType fee status availabilityEnd maxSimultaneousOrders currentOrderCount")
+    .populate("servicePost", "worker title description category serviceType fee status availabilityEnd maxSimultaneousOrders currentOrderCount closeReason")
     .populate("hirer", "fullName avatarUrl")
     .populate("resultingJob", "_id status price");
   if (!request || !request.servicePost) return res.status(404).json({ message: "ไม่พบคำขอนี้" });
   if (String(request.servicePost.worker) !== String(req.user._id)) {
     return res.status(403).json({ message: "คุณไม่ใช่เจ้าของประกาศบริการนี้" });
   }
-  res.json(request);
+  const [result] = await withRequestPaymentStates([request]);
+  const counts = await getActiveServiceOrderCounts([request.servicePost._id]);
+  result.servicePost = presentServiceCapacity(result.servicePost, counts.get(String(request.servicePost._id)));
+  res.json(result);
 });
 
 /**
@@ -274,96 +274,54 @@ const respondToServiceRequest = asyncHandler(async (req, res) => {
   if (request.status !== "pending") {
     return res.status(409).json({ message: `คำขอนี้ถูกตอบรับ/ปฏิเสธไปแล้ว (สถานะ: ${request.status})` });
   }
-  if (action === "accept" && (request.servicePost.status !== "active" || request.servicePost.availabilityEnd < new Date() ||
-      request.servicePost.currentOrderCount >= request.servicePost.maxSimultaneousOrders)) {
-    return res.status(409).json({ message: "ประกาศปิดรับหรือเต็มแล้ว ไม่สามารถยอมรับคำขอเพิ่ม" });
-  }
+  const conflict = message => Object.assign(new Error(message), { statusCode: 409 });
+  if (action === 'decline') {
+    const declined = await ServiceRequest.findOneAndUpdate({ _id: request._id, status: 'pending' },
+      { $set: { status: 'declined', respondedAt: new Date() } }, { new: true, runValidators: true });
+    if (!declined) throw conflict('คำขอนี้ได้รับการตอบรับไปแล้ว');
+  } else {
+    await withTransaction(async session => {
+      const claimed = await ServiceRequest.findOneAndUpdate({ _id: request._id, status: 'pending' },
+        { $set: { status: 'accepted', respondedAt: new Date() } }, { new: true, runValidators: true, session });
+      if (!claimed) throw conflict('คำขอนี้ได้รับการตอบรับไปแล้ว');
 
-  // Claim the request only once. Two simultaneous accept/decline calls cannot both succeed.
-  const newStatus = action === "accept" ? "accepted" : "declined";
-  const claimed = await ServiceRequest.findOneAndUpdate(
-    { _id: request._id, status: "pending" },
-    { $set: { status: newStatus, respondedAt: new Date() } },
-    { new: true, runValidators: true }
-  );
-  if (!claimed) return res.status(409).json({ message: "คำขอนี้ได้รับการตอบรับไปแล้ว" });
+      // Writing this shared post serializes all accept attempts for the same listing.
+      // Transaction retries recount work after another accept/complete/refund commits.
+      const post = await ServicePost.findOneAndUpdate({
+        _id: request.servicePost._id, worker: req.user._id, availabilityEnd: { $gte: new Date() },
+        $or: [{ status: 'active' }, { status: 'closed', closeReason: 'capacity' }],
+      }, { $inc: { currentOrderCount: 1 } }, { new: true, runValidators: true, session });
+      if (!post) throw conflict('ประกาศปิดรับหรือหมดเวลาแล้ว ไม่สามารถรับงานเพิ่มได้');
+      const limit = Number(post.maxSimultaneousOrders);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 3) throw conflict('จำนวนงานสูงสุดของประกาศไม่ถูกต้อง');
+      const counts = await getActiveServiceOrderCounts([post._id], session);
+      const activeCount = counts.get(String(post._id)) || 0;
+      if (activeCount >= limit) throw conflict(`โพสต์นี้รับงานพร้อมกันได้สูงสุด ${limit} งาน ขณะนี้มี ${activeCount} งานที่ยังไม่จบ`);
 
-  if (action === "accept") {
-    const post = request.servicePost;
-    const now = new Date();
-    // Atomic capacity reservation, including expiry and close. Avoid two Workers/orders overbooking.
-    let reserved;
-    try {
-      reserved = await ServicePost.findOneAndUpdate(
-        { _id: post._id, status: "active", availabilityEnd: { $gte: now },
-          $expr: { $lt: ["$currentOrderCount", "$maxSimultaneousOrders"] } },
-        { $inc: { currentOrderCount: 1 } },
-        { new: true, runValidators: true }
-      );
-    } catch (err) {
-      await ServiceRequest.updateOne({ _id: request._id, status: "accepted" },
-        { $set: { status: "pending", respondedAt: null } }).catch(() => {});
-      throw err;
-    }
-    if (!reserved) {
-      await ServiceRequest.updateOne({ _id: request._id, status: "accepted" },
-        { $set: { status: "pending", respondedAt: null } });
-      return res.status(409).json({ message: "ประกาศบริการปิดรับหรือเต็มแล้ว" });
-    }
-
-    const { Payment } = require("../models");
-    let job = null;
-    try {
-      // The Job keeps the service-request reference and actual delivery details.
-      job = await Job.create({
-        hirer: request.hirer,
-        category: post.category,
-        title: post.title,
+      const [job] = await Job.create([{
+        hirer: request.hirer, category: post.category, title: post.title,
         description: request.orderDetails || post.description,
         fromText: request.orderData?.pickupLocation || request.orderData?.from || post.title,
-        toText: request.orderData?.to || "",
-        notes: request.orderData?.requirements || "",
-        price: post.fee, // Demo payment tracks worker fee only. Item budget is a separate estimate.
-        scheduledAt: new Date(),
-        location: post.location,
-        contentFilterPassed: true,
-        status: "assigned",
-        selectedWorker: post.worker,
-        originServiceRequest: request._id,
-      });
-      const paymentTerms = require('../services/paymentTerms.service');
-      const feeBreakdown = paymentTerms.calculateCombinedFees(Number(post.fee), { deliveryService: post.category === "delivery" });
-      const feePercent = feeBreakdown.appPercent;
-      const fixedFee = feeBreakdown.appFixed;
-      const transactionFee = feeBreakdown.gatewayFeeAmount;
-      const feeAmount = feeBreakdown.platformFeeAmount;
-      await Payment.create({
-        job: job._id, hirer: request.hirer, worker: post.worker,
-        amount: post.fee, platformFeePercent: feePercent,
-        platformFeeAmount: feeAmount, platformFeeFixedAmount: fixedFee, netAmountToWorker: post.fee,
-        status: "pending", paymentMode: "slip_demo", gatewayFeeAmount: transactionFee, mockGatewayFeeAmount: transactionFee, mockGatewayFeePercent: feeBreakdown.gatewayPercent, mockGatewayFeeFixedAmount: feeBreakdown.gatewayFixed,
-      });
-      await ServiceRequest.updateOne({ _id: request._id, status: "accepted" },
-        { $set: { resultingJob: job._id } });
-      if (reserved.currentOrderCount >= reserved.maxSimultaneousOrders) {
-        await ServicePost.updateOne({ _id: post._id, status: "active" }, { $set: { status: "closed", closeReason: "capacity" } });
-      }
-      await logJobStatusChange({
-        jobId: job._id, previousStatus: null, newStatus: "assigned",
-        changedBy: req.user._id, note: `แปลงมาจาก Service Request ${request._id}`,
-      });
-    } catch (err) {
-      // Best-effort rollback for partial failures; an Atlas multi-document transaction
-      // would be needed for guarantees across an unexpected process crash.
-      if (job) {
-        await Payment.deleteOne({ job: job._id }).catch(() => {});
-        await Job.deleteOne({ _id: job._id }).catch(() => {});
-      }
-      await ServicePost.updateOne({ _id: post._id }, { $inc: { currentOrderCount: -1 }, $set: { status: "active", closeReason: null } }).catch(() => {});
-      await ServiceRequest.updateOne({ _id: request._id, status: "accepted" },
-        { $set: { status: "pending", respondedAt: null, resultingJob: null } }).catch(() => {});
-      throw err;
-    }
+        toText: request.orderData?.to || '', notes: request.orderData?.requirements || '',
+        price: post.fee, scheduledAt: new Date(), location: post.location, contentFilterPassed: true,
+        status: 'assigned', selectedWorker: post.worker, originServiceRequest: request._id,
+      }], { session });
+      const feeBreakdown = require('../services/paymentTerms.service').calculateCombinedFees(Number(post.fee), { deliveryService: post.category === 'delivery' });
+      await Payment.create([{
+        job: job._id, hirer: request.hirer, worker: post.worker, amount: post.fee,
+        platformFeePercent: feeBreakdown.appPercent, platformFeeAmount: feeBreakdown.platformFeeAmount,
+        platformFeeFixedAmount: feeBreakdown.appFixed, netAmountToWorker: post.fee, status: 'pending', paymentMode: 'slip_demo',
+        gatewayFeeAmount: feeBreakdown.gatewayFeeAmount, mockGatewayFeeAmount: feeBreakdown.gatewayFeeAmount,
+        mockGatewayFeePercent: feeBreakdown.gatewayPercent, mockGatewayFeeFixedAmount: feeBreakdown.gatewayFixed,
+      }], { session });
+      await ServiceRequest.updateOne({ _id: request._id, status: 'accepted' }, { $set: { resultingJob: job._id } }, { session });
+      const nextCount = activeCount + 1;
+      await ServicePost.updateOne({ _id: post._id }, { $set: {
+        currentOrderCount: nextCount, status: nextCount >= limit ? 'closed' : 'active', closeReason: nextCount >= limit ? 'capacity' : null,
+      } }, { session });
+      await logJobStatusChange({ jobId: job._id, previousStatus: null, newStatus: 'assigned', changedBy: req.user._id,
+        note: `แปลงมาจาก Service Request ${request._id}`, session });
+    });
   }
 
   const updated = await ServiceRequest.findById(request._id);

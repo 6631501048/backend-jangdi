@@ -21,18 +21,19 @@ function reset() {
   db.posts = [{_id:id.post,worker:id.worker,category:"delivery",title:"Deliver package",description:"Please pick up package",fee:35,
     currentOrderCount:0,maxSimultaneousOrders:1,availabilityEnd:new Date(Date.now()+86400000),status:"active",
     location:{type:"Point",coordinates:[99.88,20.04]},createdAt:new Date()}];
+  db.failJobCreate=false;db.failPaymentCreate=false;
   db.requests = [];
   db.jobs=[]; db.payments=[]; db.feedback=[];db.events=[];
 }
 reset();
 function chain(value) {
-  return { select(){return this;},populate(){return this;},sort(){return this;},skip(){return this;},limit(){return this;},
+  return { session(){return this;},select(){return this;},lean(){return this;},populate(){return this;},sort(){return this;},skip(){return this;},limit(){return this;},
     then(resolve,reject){return Promise.resolve(value).then(resolve,reject);} };
 }
 function match(document, query) {
   return Object.entries(query).every(([k,v])=>{
     if (k==="$expr") return document.currentOrderCount < document.maxSimultaneousOrders;
-    if (k==="$or") return true;
+    if (k==="$or") return v.some(condition=>match(document,condition));
     if (k==="availabilityEnd") return document.availabilityEnd >= v.$gte;
     if (typeof v === "object" && v !== null && !(v instanceof Date)) {
       if (v.$in) return v.$in.map(String).includes(String(document[k]));
@@ -55,10 +56,12 @@ const models = {
     countDocuments:async f=>db.posts.filter(x=>match(x,f)).length,
   },
   ServiceRequest:{
+    findOne:filter=>chain(db.requests.find(row=>match(row,filter))||null),
     findById:x=>{
       const original=db.requests.find(y=>String(y._id)===String(x));
       let doc=original?{...original}:null;
       return {
+        session(){return this;},
         populate(field){
           if(doc && field==='servicePost') doc.servicePost=db.posts.find(p=>String(p._id)===String(doc.servicePost))||null;
           if(doc && field==='hirer') doc.hirer=db.users[String(doc.hirer)]||null;
@@ -68,26 +71,34 @@ const models = {
         then(resolve,reject){return Promise.resolve(doc).then(resolve,reject);},
       };
     },
-    find:filter=>chain(db.requests),
+    find:filter=>chain(db.requests.filter(row=>match(row,filter))),
     create:async body=>{const req={_id:id.req, ...body,status:"pending"};db.requests.push(req);return req;},
     findOneAndUpdate:async(f,p)=>{const req=db.requests.find(x=>match(x,f));return req?{...update(req,p)}:null;},
     updateOne:async(f,p)=>{const req=db.requests.find(x=>match(x,f));if(req)update(req,p);},
   },
   Job:{
     findById:x=>chain(db.jobs.find(y=>String(y._id)===String(x))||null),
-    create:async body=>{const job={_id:id.job,...body};db.jobs.push(job);return job;},
+    create:async (body,options)=>{if(Array.isArray(body))return Promise.all(body.map(row=>models.Job.create(row,options)));if(db.failJobCreate)throw new Error('simulated job creation failure');const job={_id:(BigInt('0x'+id.job)+BigInt(db.jobs.length)).toString(16),...body};db.jobs.push(job);return job;},
     deleteOne:async(f)=>{db.jobs=db.jobs.filter(j=>!match(j,f));},
     find:f=>chain(db.jobs.filter(x=>match(x,f))),
     countDocuments:async f=>db.jobs.filter(x=>match(x,f)).length,
     aggregate:async()=>[],
   },
-  Payment:{create:async body=>{db.payments.push(body);return body;},deleteOne:async()=>{db.payments=[];}},
+  Payment:{find:filter=>chain(db.payments.filter(row=>match(row,filter))),create:async (body,options)=>{if(Array.isArray(body))return Promise.all(body.map(row=>models.Payment.create(row,options)));if(db.failPaymentCreate)throw new Error('simulated payment creation failure');db.payments.push(body);return body;},deleteOne:async()=>{db.payments=[];}},
   Feedback:{findOne:f=>chain(db.feedback.find(x=>match(x,f))||null)},
 };
 function stub(path, exports) {
   const resolved=require.resolve(path); require.cache[resolved]={id:resolved,filename:resolved,loaded:true,exports};
 }
 stub("../src/models",models);
+let transactionQueue=Promise.resolve();
+stub('../src/services/transaction.service',{withTransaction:work=>{
+  const transaction=transactionQueue.then(async()=>{
+    const snapshot=structuredClone(db);
+    try{return await work({});}catch(error){Object.assign(db,snapshot);throw error;}
+  });
+  transactionQueue=transaction.catch(()=>{});return transaction;
+}});
 stub("../src/services/jobLog.service",{logJobStatusChange:async()=>{}});
 stub("../src/services/notification.service",{notifyUser:async(_io,d)=>db.events.push(d)});
 stub("../src/services/matching.service",{notifyNearbyWorkers:async()=>{}});
@@ -96,7 +107,7 @@ const app=express(); app.use(express.json());
 app.use("/api/service-posts",require("../src/routes/servicePost.routes"));
 app.use("/api/jobs",require("../src/routes/job.routes"));
 app.use("/api/admin",require("../src/routes/admin.routes"));
-app.use((error,_req,res,_next)=>res.status(500).json({message:error.message}));
+app.use((error,_req,res,_next)=>res.status(error.statusCode || 500).json({message:error.message}));
 let server,base;
 const token=x=>jwt.sign({id:x},process.env.JWT_SECRET,{expiresIn:"5m"});
 async function req(method,path,{user,body}={}) {
@@ -104,7 +115,7 @@ async function req(method,path,{user,body}={}) {
   return {status:response.status,data:await response.json()};
 }
 const create=body=>req('POST',`/api/service-posts/${id.post}/requests`,{user:id.hirer,body});
-const baseOrder={orderDetails:"Deliver to F4, food 50 THB",orderData:{from:"Campus market",to:"Dorm F4",estimatedDelivery:"18:00",requirements:"buy rice",itemBudget:50}};
+const baseOrder={orderDetails:"Deliver to F4, food 50 THB",orderData:{itemName:"rice",from:"Campus market",to:"Dorm F4",estimatedDelivery:"18:00",requirements:"buy rice",itemBudget:50}};
 test.before(async()=>{server=await new Promise(r=>{const s=app.listen(0,'127.0.0.1',()=>r(s));});base=`http://127.0.0.1:${server.address().port}`;});
 test.after(async()=>{if(server) await new Promise(r=>server.close(r));});
 test('MVP-02 requires an authenticated Hirer and validates real request fields',async()=>{
@@ -150,9 +161,9 @@ test('MVP-02 declining a Service Request does not create a job',async()=>{
   assert.equal(db.jobs.length,0);
 });
 test('MVP-02 cannot accept after capacity is full or post expires',async()=>{
-  reset();await create(baseOrder);db.posts[0].currentOrderCount=1;
+  reset();await create(baseOrder);db.posts[0].currentOrderCount=1;db.jobs.push({_id:id.job,status:'assigned',originServiceRequest:id.req});
   assert.equal((await req('PATCH',`/api/service-posts/requests/${id.req}`,{user:id.worker,body:{action:'accept'}})).status,409);
-  assert.equal(db.jobs.length,0);
+  assert.equal(db.jobs.length,1);
   reset();await create(baseOrder);db.posts[0].availabilityEnd=new Date(Date.now()-1000);
   assert.equal((await req('PATCH',`/api/service-posts/requests/${id.req}`,{user:id.worker,body:{action:'accept'}})).status,409);
 });
@@ -182,4 +193,93 @@ test('MVP-02 concurrent accept requests create no duplicate job or payment',asyn
   assert.deepEqual([a.status,b.status].sort(),[200,409]);
   assert.equal(db.jobs.length,1);
   assert.equal(db.payments.length,1);
+});
+
+
+function pendingRequests(count) {
+  for(let index=0;index<count;index++) db.requests.push({
+    _id:(BigInt('0x'+id.req)+BigInt(index)).toString(16),servicePost:id.post,
+    hirer:id.hirer,status:'pending',orderDetails:baseOrder.orderDetails,orderData:baseOrder.orderData,
+  });
+}
+const acceptRequest=request=>req('PATCH',`/api/service-posts/requests/${request._id}`,{user:id.worker,body:{action:'accept'}});
+test('capacity one rejects a second distinct pending request after accepting the first',async()=>{
+  reset();pendingRequests(2);
+  assert.equal((await acceptRequest(db.requests[0])).status,200);
+  assert.equal((await acceptRequest(db.requests[1])).status,409);
+  assert.equal(db.posts[0].currentOrderCount,1);assert.equal(db.posts[0].maxSimultaneousOrders,1);
+  assert.equal(db.requests[1].status,'pending');assert.equal(db.jobs.length,1);assert.equal(db.payments.length,1);
+});
+test('different requests racing for the same post cannot exceed capacity one, two or three',async()=>{
+  for(const limit of [1,2,3]){
+    reset();db.posts[0].maxSimultaneousOrders=limit;pendingRequests(6);
+    const responses=await Promise.all(db.requests.map(acceptRequest));
+    assert.equal(responses.filter(response=>response.status===200).length,limit);
+    assert.equal(responses.filter(response=>response.status===409).length,6-limit);
+    assert.equal(db.posts[0].currentOrderCount,limit);assert.equal(db.jobs.length,limit);assert.equal(db.payments.length,limit);
+    assert.equal(db.requests.filter(request=>request.status==='accepted').length,limit);
+    assert.equal(db.posts[0].status,'closed');
+  }
+});
+test('concurrent means a finished job releases the slot for the next pending request',async()=>{
+  reset();pendingRequests(2);
+  assert.equal((await acceptRequest(db.requests[0])).status,200);
+  assert.equal((await acceptRequest(db.requests[1])).status,409);
+  // Match the committed slot release from confirmCompletion/completeRefund.
+  db.jobs[0].status='completed';db.posts[0].currentOrderCount=0;db.posts[0].status='active';db.posts[0].closeReason=null;
+  assert.equal((await acceptRequest(db.requests[1])).status,200);
+  assert.equal(db.posts[0].currentOrderCount,1);
+  assert.equal(db.jobs.filter(job=>job.status==='assigned').length,1);
+});
+
+test('failed job or payment creation releases only its reserved slot and leaves requests retryable',async()=>{
+  for(const failure of ['failJobCreate','failPaymentCreate']){
+    reset();pendingRequests(2);db[failure]=true;
+    assert.equal((await acceptRequest(db.requests[0])).status,500);
+    assert.equal(db.posts[0].currentOrderCount,0);assert.equal(db.posts[0].status,'active');
+    assert.equal(db.requests[0].status,'pending');assert.equal(db.jobs.length,0);assert.equal(db.payments.length,0);
+    db[failure]=false;
+    assert.equal((await acceptRequest(db.requests[1])).status,200);
+    assert.equal((await acceptRequest(db.requests[0])).status,409);
+    assert.equal(db.posts[0].currentOrderCount,1);assert.equal(db.jobs.length,1);
+  }
+});
+
+test('a stale zero counter cannot allow a second active order at capacity one',async()=>{
+  reset();pendingRequests(2);
+  assert.equal((await acceptRequest(db.requests[0])).status,200);
+  db.posts[0].currentOrderCount=0;db.posts[0].status='active';db.posts[0].closeReason=null;
+  const response=await acceptRequest(db.requests[1]);
+  assert.equal(response.status,409);assert.ok(response.data.message.includes('สูงสุด 1 งาน'));
+  assert.equal(db.jobs.length,1);assert.equal(db.requests[1].status,'pending');
+});
+test('the worker sees the real occupied slot even if the saved counter is zero',async()=>{
+  reset();pendingRequests(2);await acceptRequest(db.requests[0]);
+  db.posts[0].currentOrderCount=0;db.posts[0].status='active';
+  const response=await req('GET','/api/service-posts/my',{user:id.worker});
+  assert.equal(response.status,200);assert.equal(response.data[0].currentOrderCount,1);assert.equal(response.data[0].status,'closed');
+});
+test('a failed attempt does not reopen a full post or erase another accepted order',async()=>{
+  reset();pendingRequests(3);db.posts[0].maxSimultaneousOrders=2;
+  await acceptRequest(db.requests[0]);db.failPaymentCreate=true;
+  assert.equal((await acceptRequest(db.requests[1])).status,500);
+  assert.equal(db.posts[0].currentOrderCount,1);assert.equal(db.jobs.length,1);assert.equal(db.payments.length,1);
+  db.failPaymentCreate=false;
+  assert.equal((await acceptRequest(db.requests[2])).status,200);
+  assert.equal((await acceptRequest(db.requests[1])).status,409);
+  assert.equal(db.posts[0].currentOrderCount,2);assert.equal(db.posts[0].status,'closed');
+});
+
+test('request details use actual occupied work instead of a stale zero counter',async()=>{
+  reset();pendingRequests(2);await acceptRequest(db.requests[0]);
+  db.posts[0].currentOrderCount=0;db.posts[0].status='active';
+  const detail=await req('GET',`/api/service-posts/requests/${db.requests[1]._id}`,{user:id.worker});
+  assert.equal(detail.status,200);assert.equal(detail.data.servicePost.currentOrderCount,1);assert.equal(detail.data.servicePost.status,'closed');
+});
+test('a stale full counter can be reconciled when there is no active work, while manual closure stays closed',async()=>{
+  reset();pendingRequests(2);db.posts[0].currentOrderCount=3;db.posts[0].status='closed';db.posts[0].closeReason='capacity';
+  assert.equal((await acceptRequest(db.requests[0])).status,200);
+  assert.equal(db.posts[0].currentOrderCount,1);assert.equal(db.jobs.length,1);
+  reset();pendingRequests(1);db.posts[0].status='closed';db.posts[0].closeReason='manual';
+  assert.equal((await acceptRequest(db.requests[0])).status,409);assert.equal(db.jobs.length,0);
 });

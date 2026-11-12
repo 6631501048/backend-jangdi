@@ -1,3 +1,4 @@
+const { withJobPaymentStates } = require('../services/workflowStatus.service');
 const asyncHandler = require("express-async-handler");
 const multer = require("multer");
 const path = require("path");
@@ -99,12 +100,10 @@ const createJob = asyncHandler(async (req, res) => {
  */
 const getMyJobs = asyncHandler(async (req, res) => {
   const { status } = req.query;
-  const query = { hirer: req.user._id };
-  if (status === "assigned") query.status = { $in: ["assigned", "in_progress", "awaiting_confirmation"] };
-  else if (status) query.status = status;
-
-  const jobs = await Job.find(query).sort({ createdAt: -1 });
-  res.json(jobs);
+  const jobs = await Job.find({ hirer: req.user._id }).sort({ createdAt: -1 });
+  const states = await withJobPaymentStates(jobs);
+  const statuses = status === 'assigned' ? ['assigned', 'in_progress', 'awaiting_confirmation'] : [status];
+  res.json(status ? states.filter(job => statuses.includes(job.status)) : states);
 });
 
 /** GET /api/jobs/:id/timeline — real audit timestamps, limited to the job participants. */
@@ -144,7 +143,7 @@ const getJobById = asyncHandler(async (req, res) => {
   const hirerId = String(job.hirer?._id ?? job.hirer);
   const isParticipant = req.user.isAdmin || userId === hirerId ||
     (job.selectedWorker && userId === String(job.selectedWorker));
-  if (isParticipant) return res.json(job);
+  if (isParticipant) return res.json((await withJobPaymentStates([job]))[0]);
 
   let visible = job.status === "waiting";
   if (!visible) visible = Boolean(await JobWaiting.exists({ job: job._id, worker: req.user._id }));
@@ -385,68 +384,39 @@ const selectWorker = asyncHandler(async (req, res) => {
 const getMyWorkerJobs = asyncHandler(async (req, res) => {
   const { status = "waiting" } = req.query;
 
-  // Keep the waiting list free of cancelled / closed posts. Cancelled jobs
-  // remain visible in their own tab for Workers who applied before selection.
-  if (status === "waiting" || status === "cancelled") {
-    const applications = await JobWaiting.find({ worker: req.user._id })
-      .populate({ path: "job", populate: { path: "hirer", select: "fullName avatarUrl" } })
-      .sort({ createdAt: -1 });
-
-    if (status === "waiting") {
-      return res.json(applications
-        .filter((a) => a.status === "waiting" && a.job?.status === "waiting")
-        .map((a) => ({
-          id: a.job._id, status: "waiting", backendStatus: "waiting",
-          title: a.job.title, hirerName: a.job.hirer?.fullName || null,
-          price: a.job.price, category: a.job.category, scheduledAt: a.job.scheduledAt,
-        })));
-    }
-
-    // Refund completion is authoritative for Workers even if an older job record
-    // still has an active/disputed status. Show it only in the cancelled tab.
-    const refundedPayments = await Payment.find({ worker: req.user._id, status: "refunded" }).select("job").lean();
-    const refundedJobIds = refundedPayments.map((payment) => payment.job);
-    // Cancelled after assignment OR after application are both legitimate
-    // cancelled jobs for that Worker. One job appears only once.
-    const cancelledJobs = await Job.find({ selectedWorker: req.user._id, $or: [{ status: "cancelled" }, { _id: { $in: refundedJobIds } }] })
-      .populate("hirer", "fullName avatarUrl");
-    const byId = new Map();
-    for (const j of cancelledJobs) byId.set(String(j._id), j);
-    for (const a of applications) {
-      if (a.job?.status === "cancelled") byId.set(String(a.job._id), a.job);
-    }
-    return res.json(Array.from(byId.values())
-      .sort((a, b) => new Date(b.cancelledAt || b.updatedAt) - new Date(a.cancelledAt || a.updatedAt))
-      .map((j) => ({
-        id: j._id, status: "cancelled", backendStatus: "cancelled",
-        title: j.title, hirerName: j.hirer?.fullName || null,
-        price: j.price, category: j.category, scheduledAt: j.scheduledAt,
-      })));
-  }
-
   const statusMap = {
-    "in-progress": ["assigned", "in_progress", "awaiting_confirmation"],
-    disputed: ["disputed"],
-    completed: ["completed"],
+    waiting: ['waiting'], 'in-progress': ['assigned', 'in_progress', 'awaiting_confirmation'],
+    disputed: ['disputed'], completed: ['completed'], cancelled: ['cancelled'],
   };
-  const jobStatuses = statusMap[status];
-  if (!jobStatuses) return res.status(400).json({ message: "status ไม่ถูกต้อง" });
-
-  const refundedPayments = await Payment.find({ worker: req.user._id, status: "refunded" }).select("job").lean();
-  const refundedJobIds = refundedPayments.map((payment) => payment.job);
-  const jobs = await Job.find({ selectedWorker: req.user._id, status: { $in: jobStatuses }, _id: { $nin: refundedJobIds } })
-    .populate("hirer", "fullName avatarUrl")
-    .sort({ updatedAt: -1 });
-
-  res.json(jobs.map((j) => ({
-    id: j._id,
-    status,
-    backendStatus: j.status,
-    title: j.title,
-    hirerName: j.hirer?.fullName || null,
-    price: j.price,
-    category: j.category,
-    scheduledAt: j.scheduledAt,
+  if (!statusMap[status]) return res.status(400).json({ message: 'status ไม่ถูกต้อง' });
+  let jobs;
+  if (status === 'waiting') {
+    const applications = await JobWaiting.find({ worker: req.user._id })
+      .populate({ path: 'job', populate: { path: 'hirer', select: 'fullName avatarUrl' } })
+      .sort({ createdAt: -1 });
+    jobs = applications.filter(application => application.status === 'waiting' && application.job?.status === 'waiting')
+      .map(application => application.job);
+  } else {
+    const selected = await Job.find({ selectedWorker: req.user._id }).populate('hirer', 'fullName avatarUrl')
+      .sort({ updatedAt: -1 });
+    jobs = (await withJobPaymentStates(selected)).filter(job => statusMap[status].includes(job.status));
+    if (status === 'cancelled') {
+      const applications = await JobWaiting.find({ worker: req.user._id })
+        .populate({ path: 'job', populate: { path: 'hirer', select: 'fullName avatarUrl' } })
+        .sort({ createdAt: -1 });
+      const byId = new Map(jobs.map(job => [String(job._id), job]));
+      for (const application of applications) {
+        if (application.job?.status === 'cancelled' && !byId.has(String(application.job._id))) {
+          byId.set(String(application.job._id), application.job);
+        }
+      }
+      jobs = [...byId.values()].sort((a, b) => new Date(b.cancelledAt || b.updatedAt || 0) - new Date(a.cancelledAt || a.updatedAt || 0));
+    }
+  }
+  res.json(jobs.map(job => ({
+    id: job._id, status, backendStatus: job.status, paymentStatus: job.paymentStatus || null,
+    title: job.title, hirerName: job.hirer?.fullName || null, price: job.price,
+    category: job.category, scheduledAt: job.scheduledAt,
   })));
 });
 

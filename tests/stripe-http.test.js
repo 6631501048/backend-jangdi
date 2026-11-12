@@ -75,7 +75,7 @@ test('HTTP signed raw webhook confirms server total exactly once and finance rec
   const admin=await req('GET','/api/admin/financials?period=all','admin');assert.equal(admin.data.gross,105);assert.equal(admin.data.gatewayFees,3);
 });
 
-test('HTTP refund requires owner and admin, remains pending until Stripe success, and cannot repeat',async()=>{
+test('HTTP Stripe payment refund waits for admin transfer proof and never initiates a Stripe refund',async()=>{
   await paid();
   const requestPath=`/api/payments/${id.job}/refund-request`,decidePath=`/api/admin/payments/${id.pay}/refund-decision`;
   assert.equal((await req('POST',requestPath,'other',{reason:'ตรวจสอบคำขอคืนเงินทดสอบ'})).status,409);
@@ -83,13 +83,13 @@ test('HTTP refund requires owner and admin, remains pending until Stripe success
   assert.equal((await req('POST',requestPath,'hirer',{reason:'ตรวจสอบคำขอคืนเงินทดสอบ'})).status,200);
   for(const role of ['hirer','worker','other'])assert.equal((await req('POST',decidePath,role,{decision:'approved',notes:'ตรวจสอบรายการและหลักฐานครบแล้ว'})).status,403);
   assert.equal((await req('POST',decidePath,'admin',{decision:'approved',notes:'ตรวจสอบรายการและหลักฐานครบแล้ว'})).status,200);
-  assert.equal(payment.status,'disputed');assert.equal(payment.refundAmount,105);
+  assert.equal(payment.status,'refund_pending');assert.equal(payment.refundAmount,105);assert.equal(payment.refundMethod,'admin_transfer');
   refundState='succeeded';await sendEvent('refund.updated',{id:'re_test',payment_intent:'pi_test',status:'pending'});
-  assert.equal(payment.status,'refunded');assert.equal(job.status,'cancelled');
+  assert.equal(payment.status,'refund_pending');assert.equal(job.status,'disputed');
   assert.equal((await req('POST',decidePath,'admin',{decision:'approved',notes:'ตรวจสอบรายการและหลักฐานครบแล้ว'})).status,409);
   const totals=(await req('GET','/api/admin/financials?period=all','admin')).data;
-  assert.equal(totals.gross,105);assert.equal(totals.refunds,105);assert.equal(totals.netCash,-3);
-  assert.equal(stripeCalls.filter(c=>c.options.method==='POST' && c.url.endsWith('/refunds')).length,1);
+  assert.equal(totals.gross,105);assert.equal(totals.refunds,0);assert.equal(totals.pendingRefundTransfers,1);
+  assert.equal(stripeCalls.filter(c=>c.options.method==='POST' && c.url.endsWith('/refunds')).length,0);
 });
 
 test('HTTP sync requires login, role and ownership and confirms with no webhook delivery',async()=>{
@@ -104,10 +104,10 @@ test('HTTP sync requires login, role and ownership and confirms with no webhook 
   const count=stripeCalls.length;await req('POST',endpoint,'hirer');assert.equal(stripeCalls.length,count);
 });
 
-test('HTTP sync reconciles an approved refund with no refund webhook delivery',async()=>{
+test('HTTP sync reconciles a historical Stripe refund with no refund webhook delivery',async()=>{
   await paid();
   await req('POST',`/api/payments/${id.job}/refund-request`,'hirer',{reason:'ตรวจสอบคำขอคืนเงินทดสอบ'});
-  await req('POST',`/api/admin/payments/${id.pay}/refund-decision`,'admin',{decision:'approved',notes:'ตรวจสอบรายการและหลักฐานครบแล้ว'});
+  Object.assign(payment,{refundDecision:'approved',refundAmount:105,refundMethod:'stripe',stripeRefundId:'re_test',refundStatus:'pending'});
   assert.equal(payment.status,'disputed');refundState='succeeded';
   assert.equal((await req('POST',`/api/payments/${id.job}/stripe/sync`,'hirer')).data.status,'refunded');
   assert.equal(job.status,'cancelled');
@@ -116,7 +116,7 @@ test('HTTP sync reconciles an approved refund with no refund webhook delivery',a
 test('admin refund evidence queue includes successful Stripe refunds until proof is attached',async()=>{
   await paid();
   await req('POST',`/api/payments/${id.job}/refund-request`,'hirer',{reason:'ตรวจสอบคำขอคืนเงินทดสอบ'});
-  await req('POST',`/api/admin/payments/${id.pay}/refund-decision`,'admin',{decision:'approved',notes:'ตรวจสอบรายการและหลักฐานครบแล้ว'});
+  Object.assign(payment,{refundDecision:'approved',refundAmount:105,refundMethod:'stripe',stripeRefundId:'re_test',refundStatus:'pending'});
   refundState='succeeded';await req('POST',`/api/payments/${id.job}/stripe/sync`,'hirer');
   const endpoint='/api/admin/payments/escrow?status=refund_pending';
   assert.equal((await req('GET',endpoint,'worker')).status,403);

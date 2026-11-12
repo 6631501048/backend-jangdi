@@ -50,7 +50,8 @@ function financials(payments, window) {
   const fees = sum(gateway, p => p.mockGatewayFeeAmount || 0);
   return { rangeLabel:window.label, gross, workerPayouts:payouts, refunds, gatewayFees:unknownFees ? null : fees, unknownFees,
     platformFees:sum(completed,p => p.platformFeeAmount), netCash: unknownFees ? null : round(gross-payouts-refunds-fees), completedJobs:completed.length,
-    pendingRefunds:payments.filter(p => ['disputed','refund_pending'].includes(p.status) && window.includes(p.refundRequestedAt)).length,
+    pendingRefunds:payments.filter(p => p.status === 'disputed' && !p.refundDecision && window.includes(p.refundRequestedAt)).length,
+    pendingRefundTransfers:payments.filter(p => p.status === 'refund_pending').length,
     pendingSlips:payments.filter(p => p.status === 'awaiting_verification').length,
     pendingPayouts:sum(payments.filter(p => p.status === 'payout_pending'),p => p.netAmountToWorker),
     pendingRefundEvidence:payments.filter(p => p.status === 'refunded' && p.paymentMode === 'stripe_test' && p.refundStatus === 'succeeded' && !p.hasRefundSlip).length,

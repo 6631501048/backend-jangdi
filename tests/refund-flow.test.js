@@ -55,13 +55,15 @@ test('demo approval waits for admin proof and records the full customer amount w
   assert.equal(payment.refundAmount,105);assert.equal(payment.status,'refund_pending');assert.equal(job.status,'disputed');assert.equal(stripeCalls.length,0);
   await assert.rejects(invoke(controller.decideRefund,decision('approved')));
 });
-test('Stripe pending refund does not claim money returned; retries reuse idempotency key',async()=>{
-  reset('stripe_test');await submit();stripeStatus='pending';await invoke(controller.decideRefund,decision('approved'));
-  assert.equal(payment.status,'disputed');assert.equal(job.status,'disputed');assert.equal(payment.refundStatus,'pending');
-  await assert.rejects(invoke(controller.decideRefund,decision('rejected')));
-  stripeStatus='succeeded';await invoke(controller.decideRefund,decision('approved'));
-  assert.equal(payment.status,'refunded');assert.equal(stripeCalls[0].options.params.amount,10500);assert.equal(stripeCalls[1].endpoint,'refunds/re_test');assert.equal(stripeCalls.filter(c=>c.endpoint==='refunds').length,1);
+test('Stripe payments are returned by admin transfer, with no Stripe refund request',async()=>{
+  reset('stripe_test');await submit();await invoke(controller.decideRefund,decision('approved'));
+  assert.equal(payment.status,'refund_pending');assert.equal(job.status,'disputed');
+  assert.equal(payment.refundStatus,'pending');assert.equal(payment.refundMethod,'admin_transfer');assert.equal(stripeCalls.length,0);
+  await assert.rejects(invoke(controller.decideRefund,decision('approved')));
 });
+function legacyRefund(status='pending') {
+  payment.refundDecision='approved';payment.stripeRefundId='re_test';payment.refundMethod='stripe';payment.refundAmount=105;payment.refundStatus=status;
+}
 
 test('Stripe refund response validates currency, amount, owner, intent and test mode',async()=>{
   const valid={id:'re_test',status:'succeeded',livemode:false,currency:'thb',amount:10500,payment_intent:'pi_test',metadata:{paymentId:id}};
@@ -73,22 +75,21 @@ test('Stripe refund response validates currency, amount, owner, intent and test 
 });
 
 test('late pending response cannot regress a successful refund or reopen a job',async()=>{
-  reset('stripe_test');await submit();await invoke(controller.decideRefund,decision('approved'));
+  reset('stripe_test');await submit();legacyRefund();
+  await controller.completeRefund(id,{id:'re_test'});
   const old={...payment,status:'disputed'};
   await controller.recordStripeRefund(old,{id:'re_test',status:'pending',livemode:false,currency:'thb',amount:10500,payment_intent:'pi_test',metadata:{paymentId:id}});
   assert.equal(payment.status,'refunded');assert.equal(payment.refundStatus,'succeeded');assert.equal(job.status,'cancelled');
 });
 
-test('failed Stripe refund remains disputed and retry reads existing refund without charging again',async()=>{
-  reset('stripe_test');await submit();stripeStatus='failed';
+test('failed historical Stripe refund cannot start a new admin transfer',async()=>{
+  reset('stripe_test');await submit();legacyRefund('failed');
   await assert.rejects(invoke(controller.decideRefund,decision('approved')),err=>err.statusCode===409);
-  assert.equal(payment.status,'disputed');assert.equal(payment.refundStatus,'failed');
-  await assert.rejects(invoke(controller.decideRefund,decision('approved')));
-  assert.equal(stripeCalls.filter(c=>c.endpoint==='refunds').length,1);
+  assert.equal(payment.status,'disputed');assert.equal(stripeCalls.length,0);
 });
 
 test('out-of-order refund webhook uses the latest Stripe result and completes only once',async()=>{
-  reset('stripe_test');await submit();stripeStatus='pending';await invoke(controller.decideRefund,decision('approved'));
+  reset('stripe_test');await submit();legacyRefund();stripeStatus='pending';
   const webhook=require('../src/controllers/stripe.controller').webhook;
   stripeStatus='succeeded';
   const req={headers:{},body:{livemode:false,type:'refund.updated',data:{object:{id:'re_test',payment_intent:'pi_test',status:'pending'}}}};

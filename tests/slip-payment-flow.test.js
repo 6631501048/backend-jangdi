@@ -172,10 +172,10 @@ test('outbox failure rolls back payout and its evidence, allowing a safe retry',
   store.failNotification=false;assert.equal((await payout()).status,200);
 });
 
-test('Stripe refund proof requires provider success, does not repeat the refund and is private to hirer/admin',async()=>{
+test('Historical Stripe refund proof requires provider success, does not repeat the refund and is private to hirer/admin',async()=>{
   reset();Object.assign(store.payment,{paymentMode:'stripe_test',status:'held',stripePaymentIntentId:'pi_test'});
   assert.equal((await request(`/payments/${ids.job}/refund`,{body:{reason:'งานไม่ตรงตามข้อตกลงจึงขอคืนเงิน'}})).status,200);
-  assert.equal((await request(`/admin/payments/${ids.payment}/refund-decision`,{role:'admin',body:{decision:'approved',notes:'ตรวจสอบและอนุมัติคืนเงินเต็มยอด'}})).status,200);
+  Object.assign(store.payment,{refundDecision:'approved',refundAmount:105,refundMethod:'stripe',stripeRefundId:'re_test_refund',refundStatus:'pending'});
   const path=`/admin/payments/${ids.payment}/slips/refund`;
   assert.equal((await request(path,{role:'admin',body:refundForm()})).status,409);assert.equal(store.payment.hasRefundSlip,undefined);
   await refund.recordStripeRefund(store.payment,{id:'re_test_refund',status:'succeeded',livemode:false,currency:'thb',amount:10500,payment_intent:'pi_test',metadata:{paymentId:ids.payment}});

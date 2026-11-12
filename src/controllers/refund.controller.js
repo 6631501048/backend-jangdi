@@ -4,7 +4,6 @@ const mongoose = require('mongoose');
 const {Payment,Job,ServiceRequest,ServicePost} = require('../models');
 const {withTransaction} = require('../services/transaction.service');
 const {detectProofImage} = require('../utils/proofImage');
-const stripe = require('../services/stripe.service');
 const {paidTotal} = require('../services/finance.service');
 const upload = multer({storage:multer.memoryStorage(),limits:{fileSize:2*1024*1024,files:3,fields:4}}).array('evidence',3);
 const error = (message,statusCode=409) => Object.assign(new Error(message),{statusCode});
@@ -46,7 +45,8 @@ async function completeRefund(paymentId, refund, existingSession) {
     const payment = await Payment.findOneAndUpdate({_id:paymentId,status:{$in:['disputed','refund_pending']},refundDecision:'approved'},{$set:{status:'refunded',refundedAt:new Date(),refundStatus:'succeeded',...(refund ? {stripeRefundId:refund.id,refundMethod:'stripe'}:{})}},{new:true,session});
     if (payment) {
       const job = await Job.findOneAndUpdate({_id:payment.job,status:{$in:['disputed','assigned','in_progress','awaiting_confirmation']}},{$set:{status:'cancelled',cancelledAt:new Date(),cancelReason:'ผู้ดูแลอนุมัติคืนเงิน'}},{new:true,session});
-      if (job?.originServiceRequest) {
+      if (!job) throw error('ไม่พบงานที่อยู่ระหว่างคืนเงิน จึงยังไม่บันทึกว่าคืนเงินสำเร็จ');
+      if (job.originServiceRequest) {
         const origin = await ServiceRequest.findById(job.originServiceRequest).session(session);
         const post = origin?.servicePost ? await ServicePost.findById(origin.servicePost).session(session) : null;
         if (post?.currentOrderCount > 0) {
@@ -75,41 +75,31 @@ async function recordStripeRefund(payment, refund) {
 const decideRefund = asyncHandler(async (req,res) => {
   const {decision,notes} = req.body;
   if (!mongoose.isValidObjectId(req.params.id) || !['approved','rejected'].includes(decision) || typeof notes !== 'string' || notes.trim().length < 10 || notes.trim().length > 1000) return res.status(400).json({message:'กรุณาระบุผลการพิจารณาและเหตุผล 10–1000 ตัวอักษร'});
-  let payment;
   if (decision === 'approved') {
     const current = await Payment.findById(req.params.id);
-    if (current) {
-      payment = await Payment.findOneAndUpdate({ _id: current._id, paymentMode: current.paymentMode, status: 'disputed', refundDecision: null }, {
-        $set: { status: 'refund_pending', refundDecision: 'approved', refundNotes: notes.trim(), refundDecidedBy: req.user._id, refundAmount: paidTotal(current), refundStatus: 'pending', refundMethod: 'admin_transfer' },
-        $push: { slipAudit: { action: 'refund_approved', by: req.user._id, at: new Date(), notes: notes.trim() } },
-      }, { new: true, runValidators: true });
-      if (!payment) throw error('รายการนี้ถูกพิจารณาแล้ว');
-      return res.json({ message: 'อนุมัติแล้ว รอผู้ดูแลแนบสลิปคืนเงินจำลอง งานยังพักไว้จนกว่าจะบันทึกคืนเงิน' });
-    }
-  }
-  if (decision === 'rejected') {
-    await withTransaction(async session => {
-      payment = await Payment.findOneAndUpdate({_id:req.params.id,status:'disputed',refundDecision:null},{$set:{status:'held',refundDecision:'rejected',refundNotes:notes.trim(),refundDecidedBy:req.user._id}},{new:true,session});
-      if (!payment) throw error('รายการนี้ถูกพิจารณาแล้ว');
-      await Job.updateOne({_id:payment.job,status:'disputed'},{$set:{status:payment.refundPreviousJobStatus || 'awaiting_confirmation'}},{session});
-    });
-  } else {
-    // Persist approval before contacting Stripe; retries share one idempotency key.
-    payment = await Payment.findOneAndUpdate({_id:req.params.id,status:'disputed',paymentMode:'stripe_test',refundDecision:{$in:[null,'approved']}},{$set:{refundDecision:'approved',refundNotes:notes.trim(),refundDecidedBy:req.user._id}},{new:true});
+    if (!current) throw error('ไม่พบรายการชำระเงิน', 404);
+    if (current.stripeRefundId) throw error('รายการเดิมมีการคืนผ่าน Stripe แล้ว กรุณาตรวจสอบก่อนโอนคืนซ้ำ');
+    const payment = await Payment.findOneAndUpdate({
+      _id: current._id, status: 'disputed', refundDecision: null,
+      stripeRefundId: null,
+    }, {
+      $set: { status: 'refund_pending', refundDecision: 'approved', refundNotes: notes.trim(),
+        refundDecidedBy: req.user._id, refundAmount: paidTotal(current), refundStatus: 'pending', refundMethod: 'admin_transfer' },
+      $push: { slipAudit: { action: 'refund_approved', by: req.user._id, at: new Date(), notes: notes.trim() } },
+    }, { new: true, runValidators: true });
     if (!payment) throw error('รายการนี้ถูกพิจารณาแล้ว');
-    const amount = paidTotal(payment);
-    await Payment.updateOne({_id:payment._id},{$set:{refundAmount:amount}});
-    if (payment.paymentMode === 'stripe_test') {
-      if (!payment.stripePaymentIntentId) throw error('ไม่พบรายการชำระ Stripe สำหรับคืนเงิน');
-      // Once a refund exists, retrieve it instead of POSTing again after key expiry.
-      const refund = payment.stripeRefundId
-        ? await stripe.request(`refunds/${payment.stripeRefundId}`)
-        : await stripe.request('refunds',{method:'POST',key:`refund-${payment._id}`,params:{payment_intent:payment.stripePaymentIntentId,amount:Math.round(amount*100),'metadata[paymentId]':String(payment._id)}});
-      await recordStripeRefund(payment,refund);
-      if (['failed','canceled'].includes(refund.status)) throw error('Stripe คืนเงินไม่สำเร็จ กรุณาตรวจสอบรายการใน Stripe ก่อนดำเนินการต่อ');
-      return res.json({message:refund.status === 'succeeded' ? 'Stripe ยืนยันคืนเงินเต็มจำนวนแล้ว' : 'อนุมัติแล้ว กำลังรอ Stripe ยืนยันการคืนเงิน'});
-    } else throw error('รายการโอนเงินจริงต้องดำเนินการคืนเงินด้วยตนเอง');
+    return res.json({ message: 'อนุมัติแล้ว รอแอดมินโอนคืนและแนบหลักฐาน งานยังพักไว้จนกว่าจะบันทึกคืนเงิน' });
   }
-  res.json({message:decision === 'approved' ? 'บันทึกอนุมัติคืนเงินเต็มจำนวนรวมค่าบริการแล้ว':'ปฏิเสธคำขอและคืนงานสู่ขั้นตอนเดิมแล้ว'});
+  await withTransaction(async session => {
+    const payment = await Payment.findOneAndUpdate({ _id: req.params.id, status: 'disputed', refundDecision: null }, {
+      $set: { status: 'held', refundDecision: 'rejected', refundNotes: notes.trim(), refundDecidedBy: req.user._id },
+    }, { new: true, session });
+    if (!payment) throw error('รายการนี้ถูกพิจารณาแล้ว');
+    const restored = await Job.updateOne({ _id: payment.job, status: 'disputed' }, {
+      $set: { status: payment.refundPreviousJobStatus || 'awaiting_confirmation' },
+    }, { session });
+    if (restored.matchedCount === 0) throw error('สถานะงานไม่ตรงกับคำขอคืนเงิน กรุณาตรวจสอบ');
+  });
+  res.json({ message: 'ปฏิเสธคำขอและคืนงานสู่ขั้นตอนเดิมแล้ว' });
 });
 module.exports = {requestRefund,getEvidence,decideRefund,completeRefund,recordStripeRefund};

@@ -19,7 +19,7 @@ test('wages follow the payout date while job counts follow completion date',()=>
   const december=overview([payment],false,range({period:'custom',start:'2026-12-01',end:'2026-12-31'}));assert.equal(december.period.total,100);assert.equal(december.period.completedJobs,0);
 });
 test('refund approval is not a completed return until the admin records its slip',()=>{
-  const payment={...base,status:'refund_pending',refundRequestedAt:new Date('2026-11-03')};const report=financials([payment],window);assert.equal(report.refunds,0);assert.equal(report.pendingRefunds,1);assert.equal(report.held,105);
+  const payment={...base,status:'refund_pending',refundRequestedAt:new Date('2026-11-03')};const report=financials([payment],window);assert.equal(report.refunds,0);assert.equal(report.pendingRefunds,0);assert.equal(report.pendingRefundTransfers,1);assert.equal(report.held,105);
   const finished=financials([{...payment,status:'refunded',refundAmount:105,refundedAt:new Date('2026-11-04')}],window);assert.equal(finished.refunds,105);assert.equal(finished.netCash,0);
 });
 test('fee configuration defaults to five percent and accepts only five through ten',()=>{
