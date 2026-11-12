@@ -1,5 +1,5 @@
 const asyncHandler = require("express-async-handler");
-const { ServicePost, ServiceRequest, Job } = require("../models");
+const { ServicePost, ServiceRequest, Job, Payment } = require("../models");
 const { logJobStatusChange } = require("../services/jobLog.service");
 const { notifyUser } = require("../services/notification.service");
 
@@ -218,8 +218,16 @@ const getMyIncomingRequests = asyncHandler(async (req, res) => {
   const requests = await ServiceRequest.find({ servicePost: { $in: myPosts.map((p) => p._id) } })
     .populate("servicePost", "title description category serviceType fee status availabilityEnd maxSimultaneousOrders currentOrderCount")
     .populate("hirer", "fullName avatarUrl")
+    .populate("resultingJob", "_id status")
     .sort({ createdAt: -1 });
-  res.json(requests);
+  const resultingJobIds = requests.map((request) => request.resultingJob?._id).filter(Boolean);
+  const refundedPayments = await Payment.find({ worker: req.user._id, job: { $in: resultingJobIds }, status: "refunded" }).select("job").lean();
+  const refundedJobIds = new Set(refundedPayments.map((payment) => String(payment.job)));
+  res.json(requests.map((request) => {
+    const result = request.toObject();
+    if (result.resultingJob && refundedJobIds.has(String(result.resultingJob._id))) result.resultingJob.status = "cancelled";
+    return result;
+  }));
 });
 
 /** GET /api/service-posts/requests/my-as-hirer — Hirer's own requests and accepted jobs. */

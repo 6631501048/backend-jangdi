@@ -402,9 +402,13 @@ const getMyWorkerJobs = asyncHandler(async (req, res) => {
         })));
     }
 
+    // Refund completion is authoritative for Workers even if an older job record
+    // still has an active/disputed status. Show it only in the cancelled tab.
+    const refundedPayments = await Payment.find({ worker: req.user._id, status: "refunded" }).select("job").lean();
+    const refundedJobIds = refundedPayments.map((payment) => payment.job);
     // Cancelled after assignment OR after application are both legitimate
     // cancelled jobs for that Worker. One job appears only once.
-    const cancelledJobs = await Job.find({ selectedWorker: req.user._id, status: "cancelled" })
+    const cancelledJobs = await Job.find({ selectedWorker: req.user._id, $or: [{ status: "cancelled" }, { _id: { $in: refundedJobIds } }] })
       .populate("hirer", "fullName avatarUrl");
     const byId = new Map();
     for (const j of cancelledJobs) byId.set(String(j._id), j);
@@ -428,7 +432,9 @@ const getMyWorkerJobs = asyncHandler(async (req, res) => {
   const jobStatuses = statusMap[status];
   if (!jobStatuses) return res.status(400).json({ message: "status ไม่ถูกต้อง" });
 
-  const jobs = await Job.find({ selectedWorker: req.user._id, status: { $in: jobStatuses } })
+  const refundedPayments = await Payment.find({ worker: req.user._id, status: "refunded" }).select("job").lean();
+  const refundedJobIds = refundedPayments.map((payment) => payment.job);
+  const jobs = await Job.find({ selectedWorker: req.user._id, status: { $in: jobStatuses }, _id: { $nin: refundedJobIds } })
     .populate("hirer", "fullName avatarUrl")
     .sort({ updatedAt: -1 });
 

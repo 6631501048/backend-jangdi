@@ -93,7 +93,7 @@ function validateOutbound(payment,direction,amount) {
   if (isPayout ? payment.hasPayoutSlip : payment.hasRefundSlip) throw fail('รายการนี้มีหลักฐานแล้ว ไม่สามารถบันทึกซ้ำได้');
   if (!isPayout) {
     if (payment.refundDecision !== 'approved') throw fail('ยังไม่ได้อนุมัติคำขอคืนเงิน');
-    if (payment.paymentMode === 'stripe_test') {
+    if (payment.paymentMode === 'stripe_test' && payment.refundMethod === 'stripe') {
       if (payment.status !== 'refunded' || payment.refundStatus !== 'succeeded' || !payment.stripeRefundId) throw fail('ต้องรอ Stripe ยืนยันคืนเงินสำเร็จก่อนแนบหลักฐาน ห้ามโอนคืนซ้ำ');
     } else if (payment.status !== 'refund_pending' || payment.stripeRefundId) throw fail('รายการนี้ไม่ใช่รายการรอคืนเงินผ่านผู้ดูแล');
   }
@@ -113,7 +113,7 @@ const submitOutbound = [
     const payment = await Payment.findOne({ _id: req.params.id, paymentMode: {$in:['slip_demo','stripe_test','demo']}, status: direction === 'payout' ? 'payout_pending' : {$in:['refund_pending','refunded']} });
     if (!payment) throw fail('รายการไม่อยู่ในสถานะรอจ่ายหรือรอคืนเงิน');
     validateOutbound(payment,direction,amount);
-    if (direction === 'refund' && payment.paymentMode === 'stripe_test' && reference !== payment.stripeRefundId) throw fail('เลขอ้างอิงต้องตรงกับรายการคืนเงิน Stripe',400);
+    if (direction === 'refund' && payment.refundMethod === 'stripe' && reference !== payment.stripeRefundId) throw fail('เลขอ้างอิงต้องตรงกับรายการคืนเงิน Stripe',400);
     // four-eyes (opt-in ด้วย REQUIRE_FOUR_EYES=1): ผู้ตรวจสลิปห้ามเป็นผู้บันทึกการจ่ายเอง
     if (process.env.REQUIRE_FOUR_EYES === '1' && payment.slipReviewedBy && String(req.user._id) === String(payment.slipReviewedBy)) throw fail('ผู้ตรวจสลิปไม่สามารถเป็นผู้บันทึกการจ่ายเงินเองได้', 403);
     req.outboundPayment = payment;
@@ -124,7 +124,7 @@ const submitOutbound = [
     const amount = Number(req.body.amount);
     const reference = String(req.body.reference || '').trim();
     const isPayout = direction === 'payout';
-    const stripeRefund = !isPayout && req.outboundPayment.paymentMode === 'stripe_test';
+    const stripeRefund = !isPayout && req.outboundPayment.refundMethod === 'stripe';
     let notifications = [];
     const hash = require('node:crypto').createHash('sha256').update(bytes).digest('hex');
     try {

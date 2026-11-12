@@ -45,7 +45,7 @@ async function completeRefund(paymentId, refund, existingSession) {
   const work = async session => {
     const payment = await Payment.findOneAndUpdate({_id:paymentId,status:{$in:['disputed','refund_pending']},refundDecision:'approved'},{$set:{status:'refunded',refundedAt:new Date(),refundStatus:'succeeded',...(refund ? {stripeRefundId:refund.id,refundMethod:'stripe'}:{})}},{new:true,session});
     if (payment) {
-      const job = await Job.findOneAndUpdate({_id:payment.job,status:'disputed'},{$set:{status:'cancelled',cancelledAt:new Date(),cancelReason:'ผู้ดูแลอนุมัติคืนเงิน'}},{new:true,session});
+      const job = await Job.findOneAndUpdate({_id:payment.job,status:{$in:['disputed','assigned','in_progress','awaiting_confirmation']}},{$set:{status:'cancelled',cancelledAt:new Date(),cancelReason:'ผู้ดูแลอนุมัติคืนเงิน'}},{new:true,session});
       if (job?.originServiceRequest) {
         const origin = await ServiceRequest.findById(job.originServiceRequest).session(session);
         const post = origin?.servicePost ? await ServicePost.findById(origin.servicePost).session(session) : null;
@@ -78,7 +78,7 @@ const decideRefund = asyncHandler(async (req,res) => {
   let payment;
   if (decision === 'approved') {
     const current = await Payment.findById(req.params.id);
-    if (current && ['slip_demo','demo'].includes(current.paymentMode)) {
+    if (current) {
       payment = await Payment.findOneAndUpdate({ _id: current._id, paymentMode: current.paymentMode, status: 'disputed', refundDecision: null }, {
         $set: { status: 'refund_pending', refundDecision: 'approved', refundNotes: notes.trim(), refundDecidedBy: req.user._id, refundAmount: paidTotal(current), refundStatus: 'pending', refundMethod: 'admin_transfer' },
         $push: { slipAudit: { action: 'refund_approved', by: req.user._id, at: new Date(), notes: notes.trim() } },
