@@ -1,10 +1,9 @@
-const { closeUnselectedRequests, presentServiceRequestOutcome } = require('../services/serviceRequestOutcome.service');
+const { acceptServiceRequests } = require('../services/acceptServiceRequests.service');
+const { presentServiceRequestOutcome } = require('../services/serviceRequestOutcome.service');
 const { getActiveServiceOrderCounts, presentServiceCapacity } = require('../services/serviceCapacity.service');
-const { withTransaction } = require('../services/transaction.service');
 const { withRequestPaymentStates } = require('../services/workflowStatus.service');
 const asyncHandler = require("express-async-handler");
 const { ServicePost, ServiceRequest, Job, Payment } = require("../models");
-const { logJobStatusChange } = require("../services/jobLog.service");
 const { notifyUser } = require("../services/notification.service");
 
 /**
@@ -281,66 +280,39 @@ const respondToServiceRequest = asyncHandler(async (req, res) => {
       { $set: { status: 'declined', declineReason: 'worker_declined', respondedAt: new Date() } }, { new: true, runValidators: true });
     if (!declined) throw conflict('คำขอนี้ได้รับการตอบรับไปแล้ว');
   } else {
-    await withTransaction(async session => {
-      const claimed = await ServiceRequest.findOneAndUpdate({ _id: request._id, status: 'pending' },
-        { $set: { status: 'accepted', respondedAt: new Date() } }, { new: true, runValidators: true, session });
-      if (!claimed) throw conflict('คำขอนี้ได้รับการตอบรับไปแล้ว');
-
-      // Writing this shared post serializes all accept attempts for the same listing.
-      // Transaction retries recount work after another accept/complete/refund commits.
-      const post = await ServicePost.findOneAndUpdate({
-        _id: request.servicePost._id, worker: req.user._id, availabilityEnd: { $gte: new Date() },
-        $or: [{ status: 'active' }, { status: 'closed', closeReason: 'capacity' }],
-      }, { $inc: { currentOrderCount: 1 } }, { new: true, runValidators: true, session });
-      if (!post) throw conflict('ประกาศปิดรับหรือหมดเวลาแล้ว ไม่สามารถรับงานเพิ่มได้');
-      const limit = Number(post.maxSimultaneousOrders);
-      if (!Number.isInteger(limit) || limit < 1 || limit > 3) throw conflict('จำนวนงานสูงสุดของประกาศไม่ถูกต้อง');
-      const counts = await getActiveServiceOrderCounts([post._id], session);
-      const activeCount = counts.get(String(post._id)) || 0;
-      if (activeCount >= limit) throw conflict(`โพสต์นี้รับงานพร้อมกันได้สูงสุด ${limit} งาน ขณะนี้มี ${activeCount} งานที่ยังไม่จบ`);
-
-      const [job] = await Job.create([{
-        hirer: request.hirer, category: post.category, title: post.title,
-        description: request.orderDetails || post.description,
-        fromText: request.orderData?.pickupLocation || request.orderData?.from || post.title,
-        toText: request.orderData?.to || '', notes: request.orderData?.requirements || '',
-        price: post.fee, scheduledAt: new Date(), location: post.location, contentFilterPassed: true,
-        status: 'assigned', selectedWorker: post.worker, originServiceRequest: request._id,
-      }], { session });
-      const feeBreakdown = require('../services/paymentTerms.service').calculateCombinedFees(Number(post.fee), { deliveryService: post.category === 'delivery' });
-      await Payment.create([{
-        job: job._id, hirer: request.hirer, worker: post.worker, amount: post.fee,
-        platformFeePercent: feeBreakdown.appPercent, platformFeeAmount: feeBreakdown.platformFeeAmount,
-        platformFeeFixedAmount: feeBreakdown.appFixed, netAmountToWorker: post.fee, status: 'pending', paymentMode: 'slip_demo',
-        gatewayFeeAmount: feeBreakdown.gatewayFeeAmount, mockGatewayFeeAmount: feeBreakdown.gatewayFeeAmount,
-        mockGatewayFeePercent: feeBreakdown.gatewayPercent, mockGatewayFeeFixedAmount: feeBreakdown.gatewayFixed,
-      }], { session });
-      await ServiceRequest.updateOne({ _id: request._id, status: 'accepted' }, { $set: { resultingJob: job._id } }, { session });
-      const nextCount = activeCount + 1;
-      await ServicePost.updateOne({ _id: post._id }, { $set: {
-        currentOrderCount: nextCount, status: nextCount >= limit ? 'closed' : 'active', closeReason: nextCount >= limit ? 'capacity' : null,
-      } }, { session });
-      if (nextCount >= limit) await closeUnselectedRequests(post._id, 'capacity', session);
-      await logJobStatusChange({ jobId: job._id, previousStatus: null, newStatus: 'assigned', changedBy: req.user._id,
-        note: `แปลงมาจาก Service Request ${request._id}`, session });
-    });
+    await acceptServiceRequests({ postId: request.servicePost._id, requestIds: [String(request._id)], workerId: req.user._id, io: req.app.get('io') });
   }
 
   const updated = await ServiceRequest.findById(request._id);
-  const acceptedJobId = action === "accept" ? updated?.resultingJob : null;
-  await notifyUser(req.app.get("io"), {
+  if (action === "decline") await notifyUser(req.app.get("io"), {
     userId: request.hirer,
-    type: action === "accept" ? "payment_update" : "application_update",
-    title: action === "accept" ? "ผู้รับจ้างรับคำขอแล้ว กรุณาชำระเงิน" : "คำขอบริการของคุณถูกปฏิเสธ",
+    type: "application_update",
+    title: "คำขอบริการของคุณถูกปฏิเสธ",
     message: request.servicePost.title,
-    relatedEntityType: acceptedJobId ? "Job" : "ServiceRequestResult",
-    relatedEntityId: acceptedJobId || request._id,
+    relatedEntityType: "ServiceRequestResult",
+    relatedEntityId: request._id,
   });
 
   res.json({ message: `${action === "accept" ? "ยอมรับ" : "ปฏิเสธ"}คำขอสำเร็จ`, request: updated });
 });
 
+
+/** POST /api/service-posts/:id/requests/accept — Accept the selected requests together. */
+const acceptServiceRequestBatch = asyncHandler(async (req, res) => {
+  const { requestIds } = req.body || {};
+  const validId = require('mongoose').isValidObjectId;
+  if (!validId(req.params.id) || !Array.isArray(requestIds) || requestIds.length < 1 || requestIds.length > 3 ||
+      requestIds.some(id => typeof id !== 'string' || !validId(id)) || new Set(requestIds.map(id => id.toLowerCase())).size !== requestIds.length) {
+    return res.status(400).json({ message: 'เลือกคำขอที่ไม่ซ้ำกันตั้งแต่ 1 ถึง 3 รายการ' });
+  }
+  const post = await ServicePost.findById(req.params.id);
+  if (!post) return res.status(404).json({ message: 'ไม่พบประกาศบริการนี้' });
+  if (String(post.worker) !== String(req.user._id)) return res.status(403).json({ message: 'คุณไม่ใช่เจ้าของประกาศบริการนี้' });
+  const accepted = await acceptServiceRequests({ postId: post._id, requestIds: requestIds.map(id => id.toLowerCase()), workerId: req.user._id, io: req.app.get('io') });
+  res.json({ message: `ยอมรับคำขอพร้อมกัน ${accepted.length} รายการแล้ว`, requests: accepted });
+});
+
 module.exports = {
   getServicePosts, getServicePostById, createServicePost, getMyServicePosts, closeServicePost,
-  sendServiceRequest, getMyIncomingRequests, getMyOutgoingRequests, getIncomingRequestById, respondToServiceRequest,
+  sendServiceRequest, getMyIncomingRequests, getMyOutgoingRequests, getIncomingRequestById, respondToServiceRequest, acceptServiceRequestBatch,
 };

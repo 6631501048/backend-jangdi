@@ -2,7 +2,7 @@ const router = require("express").Router();
 const { protect, requireRole, requireVerifiedEmail } = require("../middleware/auth.middleware");
 const {
   getServicePosts, getServicePostById, createServicePost, getMyServicePosts, closeServicePost,
-  sendServiceRequest, getMyIncomingRequests, getMyOutgoingRequests, getIncomingRequestById, respondToServiceRequest,
+  sendServiceRequest, getMyIncomingRequests, getMyOutgoingRequests, getIncomingRequestById, respondToServiceRequest, acceptServiceRequestBatch,
 } = require("../controllers/servicePost.controller");
 
 // literal path ต้องมาก่อน "/:id" เสมอ (บทเรียนจาก job.routes.js)
@@ -13,6 +13,8 @@ router.get("/requests/my-as-worker", protect, requireRole("worker"), getMyIncomi
 router.get("/requests/my-as-hirer", protect, requireRole("hirer"), getMyOutgoingRequests);
 router.get("/requests/:id", protect, requireRole("worker"), getIncomingRequestById);
 router.patch("/requests/:id", protect, requireRole("worker"), requireVerifiedEmail, respondToServiceRequest); // FR-SERV-05/07
+
+router.post("/:id/requests/accept", protect, requireRole("worker"), requireVerifiedEmail, acceptServiceRequestBatch);
 
 router.get("/:id", getServicePostById);
 router.post("/:id/close", protect, requireRole("worker"), closeServicePost); // FR-SERV-03

@@ -21,7 +21,7 @@ function reset() {
   db.posts = [{_id:id.post,worker:id.worker,category:"delivery",title:"Deliver package",description:"Please pick up package",fee:35,
     currentOrderCount:0,maxSimultaneousOrders:1,availabilityEnd:new Date(Date.now()+86400000),status:"active",
     location:{type:"Point",coordinates:[99.88,20.04]},createdAt:new Date()}];
-  db.failOutcomeNotification=false;
+  db.failOutcomeNotification=false;db.failPaymentAt=0;
   db.failJobCreate=false;db.failPaymentCreate=false;
   db.requests = [];
   db.jobs=[]; db.payments=[]; db.feedback=[];db.events=[];
@@ -89,7 +89,7 @@ const models = {
     countDocuments:async f=>db.jobs.filter(x=>match(x,f)).length,
     aggregate:async()=>[],
   },
-  Payment:{find:filter=>chain(db.payments.filter(row=>match(row,filter))),create:async (body,options)=>{if(Array.isArray(body))return Promise.all(body.map(row=>models.Payment.create(row,options)));if(db.failPaymentCreate)throw new Error('simulated payment creation failure');db.payments.push(body);return body;},deleteOne:async()=>{db.payments=[];}},
+  Payment:{find:filter=>chain(db.payments.filter(row=>match(row,filter))),create:async (body,options)=>{if(Array.isArray(body))return Promise.all(body.map(row=>models.Payment.create(row,options)));if(db.failPaymentCreate || (db.failPaymentAt && db.payments.length+1===db.failPaymentAt))throw new Error('simulated payment creation failure');db.payments.push(body);return body;},deleteOne:async()=>{db.payments=[];}},
   Feedback:{findOne:f=>chain(db.feedback.find(x=>match(x,f))||null)},
 };
 function stub(path, exports) {
@@ -340,4 +340,60 @@ test('legacy pending requests on closed posts have a visible outcome without exp
   reset();pendingRequests(1);db.posts[0].status='closed';db.posts[0].closeReason='capacity';
   const history=await req('GET','/api/service-posts/requests/my-as-hirer',{user:id.hirer});
   assert.equal(history.data[0].status,'declined');assert.equal(history.data[0].declineReason,'capacity');
+});
+
+const acceptBatch=ids=>req('POST',`/api/service-posts/${id.post}/requests/accept`,{user:id.worker,body:{requestIds:ids}});
+test('batch selection accepts exactly the chosen hirers together and resolves the unselected requests only after filling capacity',async()=>{
+  reset();db.posts[0].maxSimultaneousOrders=2;pendingRequests(3);
+  const response=await acceptBatch([db.requests[0]._id,db.requests[2]._id]);
+  assert.equal(response.status,200);assert.equal(response.data.requests.length,2);
+  assert.equal(db.requests[0].status,'accepted');assert.equal(db.requests[2].status,'accepted');
+  assert.equal(db.requests[1].status,'declined');assert.equal(db.requests[1].declineReason,'capacity');
+  assert.equal(db.posts[0].currentOrderCount,2);assert.equal(db.jobs.length,2);assert.equal(db.payments.length,2);
+  assert.notEqual(db.requests[0].resultingJob,db.requests[2].resultingJob);
+  assert.equal(db.events.filter(event=>event.type==='payment_update').length,2);
+});
+test('batch selection enforces remaining slots including already accepted work',async()=>{
+  reset();db.posts[0].maxSimultaneousOrders=3;pendingRequests(4);await acceptRequest(db.requests[0]);
+  const ids=db.requests.slice(1).map(request=>request._id);
+  assert.equal((await acceptBatch(ids)).status,409);assert.equal(db.jobs.length,1);assert.equal(db.posts[0].currentOrderCount,1);
+  assert.ok(db.requests.slice(1).every(request=>request.status==='pending'));
+  assert.equal((await acceptBatch(ids.slice(0,2))).status,200);assert.equal(db.jobs.length,3);assert.equal(db.posts[0].currentOrderCount,3);
+});
+test('failure on the second payment rolls back every selected request, job, payment and notification',async()=>{
+  reset();db.posts[0].maxSimultaneousOrders=2;pendingRequests(2);db.failPaymentAt=2;
+  const ids=db.requests.map(request=>request._id);
+  assert.equal((await acceptBatch(ids)).status,500);assert.equal(db.jobs.length,0);assert.equal(db.payments.length,0);
+  assert.equal(db.posts[0].currentOrderCount,0);assert.equal(db.events.length,0);assert.ok(db.requests.every(request=>request.status==='pending'));
+  db.failPaymentAt=0;assert.equal((await acceptBatch(ids)).status,200);assert.equal(db.jobs.length,2);
+});
+test('batch rejects duplicate/malformed ids, foreign posts and previously handled requests without partially accepting',async()=>{
+  reset();db.posts[0].maxSimultaneousOrders=3;pendingRequests(3);
+  assert.equal((await acceptBatch([])).status,400);assert.equal((await acceptBatch(['bad'])).status,400);
+  assert.equal((await acceptBatch([db.requests[0]._id,db.requests[0]._id])).status,400);
+  const original=db.requests[1].servicePost;db.requests[1].servicePost='507f1f77bcf86cd799439999';
+  assert.equal((await acceptBatch([db.requests[0]._id,db.requests[1]._id])).status,409);assert.equal(db.jobs.length,0);
+  db.requests[1].servicePost=original;db.requests[1].status='declined';
+  assert.equal((await acceptBatch([db.requests[0]._id,db.requests[1]._id])).status,409);assert.equal(db.jobs.length,0);
+  assert.equal((await req('POST',`/api/service-posts/${id.post}/requests/accept`,{user:id.worker2,body:{requestIds:[db.requests[0]._id]}})).status,403);
+});
+test('simultaneous batch attempts cannot select the same request twice or exceed one slot',async()=>{
+  reset();pendingRequests(2);
+  const results=await Promise.all([acceptBatch([db.requests[0]._id]),acceptBatch([db.requests[1]._id])]);
+  assert.deepEqual(results.map(response=>response.status).sort(),[200,409]);assert.equal(db.jobs.length,1);assert.equal(db.posts[0].currentOrderCount,1);
+});
+
+test('a batch smaller than the remaining quota leaves the other requests pending and the post open',async()=>{
+  reset();db.posts[0].maxSimultaneousOrders=3;pendingRequests(3);
+  assert.equal((await acceptBatch(db.requests.slice(0,2).map(request=>request._id.toUpperCase()))).status,200);
+  assert.equal(db.posts[0].currentOrderCount,2);assert.equal(db.posts[0].status,'active');assert.equal(db.requests[2].status,'pending');
+});
+test('batch acceptance respects post expiry and refund closure without creating any work',async()=>{
+  for(const reason of ['expired','refund']){
+    reset();pendingRequests(1);
+    if(reason==='expired')db.posts[0].availabilityEnd=new Date(Date.now()-1000);
+    else{db.posts[0].status='closed';db.posts[0].closeReason='refund';}
+    assert.equal((await acceptBatch([db.requests[0]._id])).status,409);
+    assert.equal(db.jobs.length,0);assert.equal(db.requests[0].status,'pending');
+  }
 });
