@@ -37,6 +37,10 @@ const userSchema = new mongoose.Schema(
     },
     password: { type: String, select: false }, // ไม่บังคับถ้า login ผ่าน Google OAuth
     googleId: { type: String, default: null },
+    authVersion: { type: Number, default: 0 },
+    passwordResetToken: { type: String, default: null, select: false },
+    passwordResetExpires: { type: Date, default: null, select: false },
+    passwordResetRequestedAt: { type: Date, default: null, select: false },
 
     isEmailVerified: { type: Boolean, default: false }, // FR-AUTH-04
     emailVerificationToken: { type: String, default: null, select: false },

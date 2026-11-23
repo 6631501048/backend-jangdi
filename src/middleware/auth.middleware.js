@@ -18,6 +18,10 @@ async function protect(req, res, next) {
     if (!user) {
       return res.status(401).json({ message: "ไม่พบบัญชีผู้ใช้นี้" });
     }
+    // A password reset/change invalidates previously issued sessions, including legacy JWTs.
+    if ((decoded.av || 0) !== (user.authVersion || 0)) {
+      return res.status(401).json({ message: "รหัสผ่านมีการเปลี่ยนแปลง กรุณาเข้าสู่ระบบอีกครั้ง" });
+    }
     if (user.accountStatus === "suspended") {
       return res.status(403).json({ code: "ACCOUNT_SUSPENDED", message: "บัญชีนี้ถูกระงับการใช้งาน" });
     }

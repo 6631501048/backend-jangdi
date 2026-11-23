@@ -9,6 +9,10 @@ const nodemailer = require("nodemailer");
 let transporter = null;
 let warnedOnce = false;
 
+function isEmailConfigured() {
+  return Boolean(process.env.EMAIL_HOST && process.env.EMAIL_USER && process.env.EMAIL_PASS);
+}
+
 function getTransporter() {
   if (transporter) return transporter;
   if (!process.env.EMAIL_HOST || !process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
@@ -53,4 +57,4 @@ async function sendEmail({ to, subject, html }) {
   }
 }
 
-module.exports = { sendEmail };
+module.exports = { sendEmail, isEmailConfigured };
