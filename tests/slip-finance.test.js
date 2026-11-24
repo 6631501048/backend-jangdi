@@ -22,9 +22,9 @@ test('refund approval is not a completed return until the admin records its slip
   const payment={...base,status:'refund_pending',refundRequestedAt:new Date('2026-11-03')};const report=financials([payment],window);assert.equal(report.refunds,0);assert.equal(report.pendingRefunds,0);assert.equal(report.pendingRefundTransfers,1);assert.equal(report.held,105);
   const finished=financials([{...payment,status:'refunded',refundAmount:105,refundedAt:new Date('2026-11-04')}],window);assert.equal(finished.refunds,105);assert.equal(finished.netCash,0);
 });
-test('fee configuration defaults to five percent and accepts only five through ten',()=>{
+test('fee configuration defaults to seven percent and accepts only five through ten',()=>{
   const before=process.env.ESCROW_FEE_PERCENT_MIN;
-  try{for(const value of ['','0','4','11','bad']){process.env.ESCROW_FEE_PERCENT_MIN=value;assert.equal(feePercent(),5);}process.env.ESCROW_FEE_PERCENT_MIN='7.5';assert.equal(feePercent(),7.5);process.env.ESCROW_FEE_PERCENT_MIN='10';assert.equal(feePercent(),10);}
+  try{for(const value of ['','0','4','11','bad']){process.env.ESCROW_FEE_PERCENT_MIN=value;assert.equal(feePercent(),7);}process.env.ESCROW_FEE_PERCENT_MIN='7.5';assert.equal(feePercent(),7.5);process.env.ESCROW_FEE_PERCENT_MIN='10';assert.equal(feePercent(),10);}
   finally{if(before===undefined)delete process.env.ESCROW_FEE_PERCENT_MIN;else process.env.ESCROW_FEE_PERCENT_MIN=before;}
 });
 

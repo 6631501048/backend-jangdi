@@ -1,6 +1,6 @@
 function feePercent() {
   const value = Number(process.env.ESCROW_FEE_PERCENT_MIN);
-  return value >= 5 && value <= 10 ? value : 5;
+  return value >= 5 && value <= 10 ? value : 7;
 }
 function terms() {
   return {
@@ -22,22 +22,21 @@ function mockStripeFeePercent() {
   return Number.isFinite(value) && value >= 0 && value <= 100 ? value : 3.65;
 }
 function serviceOrderFeePercent() {
-  const value = Number(process.env.SERVICE_ORDER_FEE_PERCENT);
-  return Number.isFinite(value) && value >= 5 && value <= 10 ? value : 10;
+  return feePercent();
 }
 function serviceOrderFixedFeeAmount() {
-  const value = Number(process.env.SERVICE_ORDER_FIXED_FEE);
-  return Number.isFinite(value) && value >= 0 && value <= 100 ? value : 10;
+  return 0;
 }
-function calculateCombinedFees(amount, { deliveryService = false } = {}) {
+function calculateCombinedFees(amount) {
   const baseAmount = Math.max(0, Number(amount) || 0);
-  const appPercent = deliveryService ? serviceOrderFeePercent() : feePercent();
-  const appFixed = deliveryService ? serviceOrderFixedFeeAmount() : 0;
+  const appPercent = feePercent();
+  const appFixed = 0;
   const gatewayPercent = mockStripeFeePercent();
   const gatewayFixed = 10;
   const baseAppFee = baseAmount * appPercent / 100 + appFixed;
   const rate = gatewayPercent / 100;
-  const total = rate < 1 ? (baseAppFee + baseAmount * rate + gatewayFixed) / (1 - rate) : baseAppFee;
+  // Every job type has the same flat platform charge; Stripe costs come out of it.
+  const total = baseAppFee;
   const platformFeeAmount = Math.round(total * 100) / 100;
   const gatewayFeeAmount = Math.round((baseAmount + platformFeeAmount) * rate * 100 + gatewayFixed * 100) / 100;
   return {

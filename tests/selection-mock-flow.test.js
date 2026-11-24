@@ -68,7 +68,7 @@ test("selecting a Worker creates pending slip-demo payment and preserves applica
   assert.equal(store.payment.status, "pending");
   assert.equal(store.payment.paymentMode, "slip_demo");
   assert.equal(store.payment.amount, 120);
-  assert.equal(store.payment.platformFeeAmount, 5);
+  assert.equal(store.payment.platformFeeAmount, 8.4);
   assert.equal(store.payment.netAmountToWorker, 120);
   assert.equal(store.applicants.find(a => a.worker === "worker1").status, "selected");
   assert.equal(store.applicants.find(a => a.worker === "worker2").status, "not_selected");
