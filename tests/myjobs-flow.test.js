@@ -13,7 +13,7 @@ const candidates = (query, records) => records.filter((r) => {
     return String(actual) === String(expected);
   });
 });
-const queryResult = (rows) => ({ populate() { return this; }, async sort() { return rows; }, then(resolve, reject) { return Promise.resolve(rows).then(resolve, reject); } });
+const queryResult = (rows) => ({ populate() { return this; }, select() { return this; }, lean() { return this; }, async sort() { return rows; }, then(resolve, reject) { return Promise.resolve(rows).then(resolve, reject); } });
 const models = {
   Job: {
     findById: async (id) => store.job?._id === id ? clone(store.job) : null,
@@ -29,7 +29,7 @@ const models = {
     async countDocuments() { return 0; },
   },
   JobLog: { find: () => queryResult(store.logs) },
-  Payment: { create: async (p) => { store.payment.push(p); return p; } },
+  Payment: { find: query => queryResult(candidates(query, store.payment)), create: async (p) => { store.payment.push(p); return p; } },
 };
 const stub = (file, exports) => {
   const id = require.resolve(file);

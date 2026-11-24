@@ -1,7 +1,7 @@
 const router = require("express").Router();
 const { protect, adminOnly } = require("../middleware/auth.middleware");
 const {
-  getPendingJobs, approveJob, rejectJob,
+  getPendingJobs, getAllJobs, getAllServicePosts, approveJob, rejectJob, approveServicePost, rejectServicePost,
   getDashboard, getUsers, updateUserStatus,
   getEscrowPayments, decideRefund,
   getReports, resolveReport,
@@ -10,14 +10,21 @@ const {
 
 router.use(protect, adminOnly); // NFR-SEC-04: ทุก route ในนี้ต้องเป็น Admin เท่านั้น
 
+router.get('/financials', require('../controllers/finance.controller').getFinancials);
 router.get("/dashboard", getDashboard); // FR-ADMIN-01
-router.get("/jobs/pending", getPendingJobs); // FR-ADMIN-02
+router.get("/jobs/pending", getPendingJobs);
+router.get("/jobs", getAllJobs); // full lifecycle view (Admin only) // FR-ADMIN-02
+router.get("/service-posts", getAllServicePosts); // Worker listings, read-only
 router.post("/jobs/:id/approve", approveJob); // FR-JOB-05–06, FR-MATCH-01–02
 router.post("/jobs/:id/reject", rejectJob); // FR-ADMIN-02
+router.post("/service-posts/:id/approve", approveServicePost);
+router.post("/service-posts/:id/reject", rejectServicePost);
 router.get("/users", getUsers); // FR-ADMIN-03
 router.post("/users/:id/suspend", updateUserStatus); // FR-ADMIN-03
-router.get("/payments/escrow", getEscrowPayments); // FR-ADMIN-04
-router.post("/payments/:id/refund-decision", decideRefund); // FR-ADMIN-05, FR-PAY-07
+router.get("/payments/escrow", getEscrowPayments);
+router.post('/payments/:id/slip-review', require('../controllers/slipPayment.controller').reviewInbound);
+router.post('/payments/:id/slips/:direction', ...require('../controllers/slipPayment.controller').submitOutbound); // FR-ADMIN-04
+router.post("/payments/:id/refund-decision", require('../controllers/refund.controller').decideRefund); // FR-ADMIN-05, FR-PAY-07
 router.get("/reports", getReports); // FR-ADMIN-06
 router.post("/reports/:id/resolve", resolveReport); // FR-ADMIN-06
 router.get("/sos", getSosList); // FR-ADMIN-07

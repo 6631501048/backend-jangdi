@@ -33,6 +33,8 @@ async function deliverNotification(io, notification) {
       message: notification.message,
       isRead: notification.isRead,
       createdAt: notification.createdAt,
+      relatedEntityType: notification.relatedEntityType,
+      relatedEntityId: notification.relatedEntityId,
     });
     await Notification.updateOne(
       { _id: notification._id, deliveryStatus: "pending" },

@@ -9,6 +9,18 @@ const serviceRequestSchema = new mongoose.Schema(
     servicePost: { type: mongoose.Schema.Types.ObjectId, ref: "ServicePost", required: true },
     hirer: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     orderDetails: { type: String, required: true },
+    // MVP-02: ค่าในฟอร์มจริง ไม่สรุปยอดสินค้าจากข้อความด้วยการเดา
+    orderData: {
+      serviceType: { type: String, enum: ["shopping", "pickup_delivery", "passenger", null], default: null },
+      itemName: { type: String, default: "" },
+      pickupLocation: { type: String, default: "" },
+      passengerCount: { type: Number, default: null, min: 1 },
+      from: { type: String, default: "" },
+      to: { type: String, default: "" },
+      estimatedDelivery: { type: String, default: "" },
+      requirements: { type: String, default: "" },
+      itemBudget: { type: Number, default: null, min: 0 },
+    },
 
     // FR-SERV-05 / FR-SERV-07: pending -> accepted (แปลงเป็น Job) / declined
     status: {
@@ -16,6 +28,7 @@ const serviceRequestSchema = new mongoose.Schema(
       enum: ["pending", "accepted", "declined"],
       default: "pending",
     },
+    declineReason: { type: String, enum: ['worker_declined', 'capacity', 'refund', 'post_closed', 'expired', null], default: null },
     respondedAt: { type: Date, default: null },
 
     // เมื่อ accepted แล้วจะสร้าง Job และเก็บ reference ไว้ที่นี่ด้วย

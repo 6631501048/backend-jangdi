@@ -8,11 +8,13 @@ const servicePostSchema = new mongoose.Schema(
   {
     worker: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     category: { type: String, required: true, trim: true },
+    serviceType: { type: String, enum: ["shopping", "pickup_delivery", "passenger", null], default: null },
     title: { type: String, required: true, trim: true },
+    locationLabel: { type: String, default: "", trim: true },
     description: { type: String, required: true },
     fee: { type: Number, required: true, min: 0 },
 
-    maxSimultaneousOrders: { type: Number, required: true, min: 1 },
+    maxSimultaneousOrders: { type: Number, required: true, min: 1, max: 3 },
     currentOrderCount: { type: Number, default: 0 },
 
     availabilityStart: { type: Date, required: true },
@@ -27,9 +29,12 @@ const servicePostSchema = new mongoose.Schema(
     // FR-SERV-02 / FR-SERV-03 / FR-SERV-06
     status: {
       type: String,
-      enum: ["active", "closed", "expired"],
-      default: "active",
+      enum: ["pending_review", "active", "rejected", "closed", "expired"],
+      default: "pending_review",
     },
+    closeReason: { type: String, enum: ["manual", "capacity", "refund", null], default: null },
+    closeNote: { type: String, default: "", trim: true, maxlength: 500 },
+    rejectionReason: { type: String, default: null },
   },
   { timestamps: true }
 );

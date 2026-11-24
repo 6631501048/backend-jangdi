@@ -37,6 +37,10 @@ const userSchema = new mongoose.Schema(
     },
     password: { type: String, select: false }, // ไม่บังคับถ้า login ผ่าน Google OAuth
     googleId: { type: String, default: null },
+    authVersion: { type: Number, default: 0 },
+    passwordResetToken: { type: String, default: null, select: false },
+    passwordResetExpires: { type: Date, default: null, select: false },
+    passwordResetRequestedAt: { type: Date, default: null, select: false },
 
     isEmailVerified: { type: Boolean, default: false }, // FR-AUTH-04
     emailVerificationToken: { type: String, default: null, select: false },
@@ -75,6 +79,16 @@ const userSchema = new mongoose.Schema(
       enum: ["active", "warned", "suspended"],
       default: "active",
     },
+
+    // FR-ADMIN-03: เก็บเหตุผลและผู้ดำเนินการในเอกสารเดียวกับสถานะ เพื่อไม่ให้สถานะเปลี่ยนโดยไม่มีประวัติ
+    moderationHistory: { type: [new mongoose.Schema({
+      action: { type: String, enum: ["warn", "suspend", "clear"], required: true },
+      previousStatus: { type: String, required: true },
+      newStatus: { type: String, required: true },
+      reason: { type: String, required: true, trim: true, maxlength: 500 },
+      performedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+      performedAt: { type: Date, required: true },
+    }, { _id: false })], select: false, default: [] },
 
     // ตำแหน่งปัจจุบันโดยประมาณของผู้ใช้ (ใช้คำนวณระยะทางตอน browse/matching)
     // หมายเหตุ: ห้ามใส่ default ให้ "type" ที่นี่ — ถ้าใส่ Mongoose จะสร้าง

@@ -60,4 +60,15 @@ const submitReview = asyncHandler(async (req, res) => {
   res.status(201).json({ message: "ส่งรีวิวสำเร็จ", feedback });
 });
 
-module.exports = { submitReview };
+const getReviewStatus = asyncHandler(async (req, res) => {
+  const job = await Job.findById(req.params.id).select("hirer selectedWorker status");
+  if (!job) return res.status(404).json({ message: "ไม่พบงานนี้" });
+  const isHirer = String(job.hirer) === String(req.user._id);
+  const isWorker = String(job.selectedWorker) === String(req.user._id);
+  if (!isHirer && !isWorker) return res.status(403).json({ message: "คุณไม่เกี่ยวข้องกับงานนี้" });
+  const direction = isHirer ? "hirer_to_worker" : "worker_to_hirer";
+  const existing = await Feedback.findOne({ job: job._id, direction }).select("_id rating createdAt");
+  res.json({ eligible: job.status === "completed", reviewed: Boolean(existing), review: existing || null });
+});
+
+module.exports = { submitReview, getReviewStatus };

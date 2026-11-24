@@ -5,12 +5,13 @@ const crypto = require("crypto");
 const { OAuth2Client } = require("google-auth-library");
 const { User } = require("../models");
 const { isLamduanEmail } = require("../utils/validators");
-const { sendEmail } = require("../utils/mailer");
+const { sendEmail, isEmailConfigured } = require("../utils/mailer");
+const { validPassword, normalizeEmail, hashResetToken } = require("../utils/passwordRecovery");
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-function signToken(userId) {
-  return jwt.sign({ id: userId }, process.env.JWT_SECRET, {
+function signToken(user) {
+  return jwt.sign({ id: user._id, av: user.authVersion || 0 }, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN || "7d",
   });
 }
@@ -21,6 +22,10 @@ function sanitizeUser(user) {
   delete obj.password;
   delete obj.emailVerificationToken;
   delete obj.emailVerificationExpires;
+  delete obj.passwordResetToken;
+  delete obj.passwordResetExpires;
+  delete obj.passwordResetRequestedAt;
+  delete obj.authVersion;
   return obj;
 }
 
@@ -53,7 +58,8 @@ async function sendVerificationEmail(user) {
  * ลงทะเบียนด้วยอีเมล Lamduan + รหัสผ่าน แล้วส่งอีเมลยืนยัน (TODO: ต่อ email provider จริง)
  */
 const register = asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
+  const email = normalizeEmail(req.body.email);
+  const { password } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ message: "กรุณากรอก email และ password ให้ครบ" });
@@ -61,8 +67,8 @@ const register = asyncHandler(async (req, res) => {
   if (!isLamduanEmail(email)) {
     return res.status(400).json({ message: "ต้องใช้อีเมล @lamduan.mfu.ac.th เท่านั้น" });
   }
-  if (password.length < 8) {
-    return res.status(400).json({ message: "รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร" });
+  if (!validPassword(password)) {
+    return res.status(400).json({ message: "รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร และไม่เกิน 72 ไบต์" });
   }
 
   const existing = await User.findOne({ email: email.toLowerCase() });
@@ -82,15 +88,19 @@ const register = asyncHandler(async (req, res) => {
   res.status(201).json({
     message: "ลงทะเบียนสำเร็จ กรุณายืนยันอีเมลก่อนใช้งาน",
     emailSent: mail.sent,
-    token: signToken(user._id),
+    token: signToken(user),
     user: sanitizeUser(user),
   });
 });
 
 /** POST /api/auth/login (email/password) */
 const login = asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
-  const user = await User.findOne({ email: email?.toLowerCase() }).select("+password");
+  const email = normalizeEmail(req.body.email);
+  const { password } = req.body;
+  if (!isLamduanEmail(email) || typeof password !== "string" || !password) {
+    return res.status(401).json({ message: "อีเมลหรือรหัสผ่านไม่ถูกต้อง" });
+  }
+  const user = await User.findOne({ email }).select("+password");
   if (!user || !user.password) {
     return res.status(401).json({ message: "อีเมลหรือรหัสผ่านไม่ถูกต้อง" });
   }
@@ -102,7 +112,7 @@ const login = asyncHandler(async (req, res) => {
     return res.status(403).json({ code: "ACCOUNT_SUSPENDED", message: "บัญชีนี้ถูกระงับการใช้งาน กรุณาติดต่อผู้ดูแลระบบ" });
   }
   res.json({
-    token: signToken(user._id),
+    token: signToken(user),
     user: sanitizeUser(user),
   });
 });
@@ -113,40 +123,50 @@ const login = asyncHandler(async (req, res) => {
  */
 const googleLogin = asyncHandler(async (req, res) => {
   const { idToken } = req.body;
-  const ticket = await googleClient.verifyIdToken({
-    idToken,
-    audience: process.env.GOOGLE_CLIENT_ID,
-  });
+  if (typeof idToken !== "string" || !idToken) return res.status(400).json({ message: "ไม่พบข้อมูลเข้าสู่ระบบจาก Google" });
+  let ticket;
+  try {
+    ticket = await googleClient.verifyIdToken({ idToken, audience: process.env.GOOGLE_CLIENT_ID });
+  } catch {
+    return res.status(401).json({ message: "ข้อมูลเข้าสู่ระบบจาก Google ไม่ถูกต้องหรือหมดอายุ กรุณาลองใหม่" });
+  }
   const payload = ticket.getPayload();
+  const email = normalizeEmail(payload?.email);
 
-  if (!isLamduanEmail(payload.email)) {
+  if (payload?.email_verified !== true || !payload.sub || !isLamduanEmail(email)) {
     return res.status(403).json({ message: "ต้องใช้บัญชี Google ของอีเมล @lamduan.mfu.ac.th เท่านั้น" });
   }
 
-  let user = await User.findOne({ email: payload.email.toLowerCase() });
+  let user = await User.findOne({ email });
   const isNewUser = !user;
 
   if (!user) {
     user = await User.create({
-      email: payload.email.toLowerCase(),
+      email,
       googleId: payload.sub,
       fullName: payload.name,
       avatarUrl: payload.picture,
       isEmailVerified: true, // Google ยืนยันอีเมลให้แล้ว
-      studentId: payload.email.split("@")[0],
+      studentId: email.split("@")[0],
     });
-  } else if (!user.googleId) {
-    user.googleId = payload.sub;
-    await user.save();
   }
 
   if (user.accountStatus === "suspended") {
     return res.status(403).json({ code: "ACCOUNT_SUSPENDED", message: "บัญชีนี้ถูกระงับการใช้งาน กรุณาติดต่อผู้ดูแลระบบ" });
   }
 
+  if (user.googleId && user.googleId !== payload.sub) {
+    return res.status(409).json({ message: "บัญชี Google ไม่ตรงกับบัญชีที่เชื่อมไว้ กรุณาติดต่อผู้ดูแลระบบ" });
+  }
+  if (!user.googleId || !user.isEmailVerified) {
+    user.googleId = payload.sub;
+    user.isEmailVerified = true;
+    await user.save();
+  }
+
   // FR-AUTH-05: ถ้าเป็นผู้ใช้ใหม่/ยังกรอกโปรไฟล์ไม่ครบ ให้ frontend พาไปหน้ากรอกโปรไฟล์ต่อ
   res.json({
-    token: signToken(user._id),
+    token: signToken(user),
     isNewUser,
     user: sanitizeUser(user),
   });
@@ -174,11 +194,11 @@ const switchRole = asyncHandler(async (req, res) => {
 /** PATCH /api/auth/password — FR-PROF-01: เปลี่ยนรหัสผ่าน */
 const changePassword = asyncHandler(async (req, res) => {
   const { current, next } = req.body;
-  if (!current || !next) {
+  if (typeof current !== "string" || !current) {
     return res.status(400).json({ message: "กรุณากรอกรหัสผ่านปัจจุบันและรหัสผ่านใหม่" });
   }
-  if (next.length < 8) {
-    return res.status(400).json({ message: "รหัสผ่านใหม่ต้องมีอย่างน้อย 8 ตัวอักษร" });
+  if (!validPassword(next)) {
+    return res.status(400).json({ message: "รหัสผ่านใหม่ต้องมีอย่างน้อย 8 ตัวอักษร และไม่เกิน 72 ไบต์" });
   }
 
   const user = await User.findById(req.user._id).select("+password");
@@ -192,8 +212,11 @@ const changePassword = asyncHandler(async (req, res) => {
   }
 
   user.password = await bcrypt.hash(next, 10);
+  user.authVersion = (user.authVersion || 0) + 1;
+  user.passwordResetToken = null;
+  user.passwordResetExpires = null;
   await user.save();
-  res.json({ message: "เปลี่ยนรหัสผ่านสำเร็จ" });
+  res.json({ message: "เปลี่ยนรหัสผ่านสำเร็จ", token: signToken(user) });
 });
 
 /** GET /api/auth/verify-email?token=... — FR-AUTH-04 */
@@ -249,4 +272,58 @@ const resendVerification = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { register, login, googleLogin, getMe, switchRole, changePassword, verifyEmail, resendVerification };
+const RECOVERY_MESSAGE = "หากอีเมลนี้มีบัญชี JangDi ที่ใช้งานได้ ระบบจะส่งลิงก์สำหรับตั้งรหัสผ่าน กรุณาตรวจสอบกล่องจดหมายและสแปม";
+
+/** One flow covers both forgotten passwords and Google-only accounts adding a password. */
+const forgotPassword = asyncHandler(async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  if (!isLamduanEmail(email)) return res.status(400).json({ message: "ต้องใช้อีเมล @lamduan.mfu.ac.th เท่านั้น" });
+  // Fail uniformly for all addresses when SMTP is unavailable. Never return a reset token.
+  if (!isEmailConfigured()) return res.status(503).json({ message: "ระบบส่งอีเมลยังไม่พร้อม กรุณาลองใหม่ภายหลัง หรือเข้าสู่ระบบด้วย Google" });
+  const origin = process.env.CLIENT_URL || "http://localhost:5173";
+  let resetUrl;
+  try {
+    resetUrl = new URL('/reset-password', origin);
+    if (!['http:', 'https:'].includes(resetUrl.protocol)) throw new Error('Invalid CLIENT_URL');
+  } catch {
+    return res.status(503).json({ message: "ระบบกู้คืนบัญชียังไม่พร้อม กรุณาลองใหม่ภายหลัง" });
+  }
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = hashResetToken(token);
+  const now = new Date();
+  const user = await User.findOneAndUpdate({
+    email, accountStatus: { $ne: 'suspended' },
+    $or: [{ passwordResetRequestedAt: null }, { passwordResetRequestedAt: { $lte: new Date(now.getTime() - 60_000) } }],
+  }, { $set: { passwordResetToken: tokenHash, passwordResetExpires: new Date(now.getTime() + 15 * 60_000), passwordResetRequestedAt: now } }, { new: true });
+  if (user) {
+    // The fragment keeps the secret out of HTTP request URLs and referrer headers.
+    resetUrl.hash = `token=${token}`;
+    const result = await sendEmail({ to: user.email, subject: 'ตั้งรหัสผ่านบัญชี JangDi',
+      html: `<p>คุณขอตั้งรหัสผ่านสำหรับบัญชี JangDi</p><p><a href="${resetUrl.href}">ตั้งรหัสผ่านใหม่</a></p><p>ลิงก์ใช้ได้ครั้งเดียวและหมดอายุใน 15 นาที ใช้ได้ทั้งการตั้งรหัสผ่านครั้งแรกและการลืมรหัสผ่าน</p><p>หากไม่ได้เป็นผู้ขอ สามารถข้ามอีเมลนี้ได้ รหัสผ่านเดิมยังใช้งานได้</p>` });
+    if (!result.sent) {
+      // Don't invalidate a newer request if sending this older email failed.
+      await User.updateOne({ _id: user._id, passwordResetToken: tokenHash }, { $set: { passwordResetToken: null, passwordResetExpires: null, passwordResetRequestedAt: null } });
+      console.warn('[auth] Password recovery email could not be delivered');
+    }
+  }
+  // Identical response for absent, suspended and throttled accounts and mail failures.
+  return res.json({ message: RECOVERY_MESSAGE, retryAfterSeconds: 60 });
+});
+
+const resetPassword = asyncHandler(async (req, res) => {
+  const { token, password } = req.body;
+  if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) {
+    return res.status(400).json({ code: 'RESET_LINK_INVALID', message: 'ลิงก์ไม่ถูกต้อง หมดอายุ หรือถูกใช้งานแล้ว กรุณาขอลิงก์ใหม่' });
+  }
+  if (!validPassword(password)) return res.status(400).json({ message: 'รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร และไม่เกิน 72 ไบต์' });
+  const hashed = await bcrypt.hash(password, 10);
+  // Atomic consumption: two requests with the same link cannot both change a password.
+  const user = await User.findOneAndUpdate({ passwordResetToken: hashResetToken(token), passwordResetExpires: { $gt: new Date() }, accountStatus: { $ne: 'suspended' } }, {
+    $set: { password: hashed, passwordResetToken: null, passwordResetExpires: null, isEmailVerified: true, emailVerificationToken: null, emailVerificationExpires: null },
+    $inc: { authVersion: 1 },
+  }, { new: true });
+  if (!user) return res.status(400).json({ code: 'RESET_LINK_INVALID', message: 'ลิงก์ไม่ถูกต้อง หมดอายุ หรือถูกใช้งานแล้ว กรุณาขอลิงก์ใหม่' });
+  return res.json({ message: 'ตั้งรหัสผ่านสำเร็จ กรุณาเข้าสู่ระบบด้วยรหัสผ่านใหม่' });
+});
+
+module.exports = { register, login, googleLogin, getMe, switchRole, changePassword, verifyEmail, resendVerification, forgotPassword, resetPassword };

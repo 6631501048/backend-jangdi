@@ -1,10 +1,13 @@
+const { withJobPaymentStates } = require('../services/workflowStatus.service');
 const asyncHandler = require("express-async-handler");
 const multer = require("multer");
 const path = require("path");
+const mongoose = require("mongoose");
 const fs = require("fs");
 const { randomUUID } = require("crypto");
 const { detectProofImage } = require("../utils/proofImage");
-const { Job, JobWaiting, Payment, JobLog } = require("../models");
+const { readCompletionProof } = require("../services/jobProof.service");
+const { Job, JobWaiting, Payment, JobLog, ServiceRequest, ServicePost, User } = require("../models");
 const { checkContent } = require("../utils/contentFilter");
 const { logJobStatusChange } = require("../services/jobLog.service");
 const { createNotification, deliverNotification, notifyUser } = require("../services/notification.service");
@@ -97,12 +100,10 @@ const createJob = asyncHandler(async (req, res) => {
  */
 const getMyJobs = asyncHandler(async (req, res) => {
   const { status } = req.query;
-  const query = { hirer: req.user._id };
-  if (status === "assigned") query.status = { $in: ["assigned", "in_progress", "awaiting_confirmation"] };
-  else if (status) query.status = status;
-
-  const jobs = await Job.find(query).sort({ createdAt: -1 });
-  res.json(jobs);
+  const jobs = await Job.find({ hirer: req.user._id }).sort({ createdAt: -1 });
+  const states = await withJobPaymentStates(jobs);
+  const statuses = status === 'assigned' ? ['assigned', 'in_progress', 'awaiting_confirmation'] : [status];
+  res.json(status ? states.filter(job => statuses.includes(job.status)) : states);
 });
 
 /** GET /api/jobs/:id/timeline — real audit timestamps, limited to the job participants. */
@@ -120,11 +121,34 @@ const getJobTimeline = asyncHandler(async (req, res) => {
   })));
 });
 
-/** GET /api/jobs/:id — FR-BROWSE-03 (ดูรายละเอียดงาน) */
+// ฟิลด์ที่คนนอกเห็นได้ (ตรงกับที่หน้า browse ใช้จริง)
+// ไม่รวม: location, selectedWorker, rejectionReason, cancelReason, approvedBy/At,
+// completionProof*, originServiceRequest
+const PUBLIC_JOB_FIELDS = [
+  "_id", "category", "title", "description", "locationText", "fromText", "toText",
+  "deliveryFee", "notes", "price", "scheduledAt", "durationStart", "durationEnd",
+  "status", "createdAt", "hirer",
+];
+const pickPublicJob = (job) => {
+  const plain = typeof job.toJSON === "function" ? job.toJSON() : job;
+  return Object.fromEntries(PUBLIC_JOB_FIELDS.filter((key) => key in plain).map((key) => [key, plain[key]]));
+};
+
 const getJobById = asyncHandler(async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: "ไม่พบประกาศงานนี้" });
   const job = await Job.findById(req.params.id).populate("hirer", "fullName avatarUrl credibilityScore");
   if (!job) return res.status(404).json({ message: "ไม่พบประกาศงานนี้" });
-  res.json(job);
+
+  const userId = String(req.user._id);
+  const hirerId = String(job.hirer?._id ?? job.hirer);
+  const isParticipant = req.user.isAdmin || userId === hirerId ||
+    (job.selectedWorker && userId === String(job.selectedWorker));
+  if (isParticipant) return res.json((await withJobPaymentStates([job]))[0]);
+
+  let visible = job.status === "waiting";
+  if (!visible) visible = Boolean(await JobWaiting.exists({ job: job._id, worker: req.user._id }));
+  if (!visible) return res.status(404).json({ message: "ไม่พบประกาศงานนี้" });
+  res.json(pickPublicJob(job));
 });
 
 /**
@@ -181,16 +205,24 @@ const cancelJob = asyncHandler(async (req, res) => {
  */
 const getFeed = asyncHandler(async (req, res) => {
   const { category, search } = req.query;
-  const query = { status: "waiting" };
+  // Exclude legacy/inconsistent records that still say "waiting" even though
+  // completion has already been confirmed. Null also matches older documents
+  // where the optional completion field was never stored.
+  const query = { status: "waiting", completionConfirmedAt: null };
   if (category && category !== "all") query.category = category;
   if (search) {
+    if (typeof search !== 'string' || search.length > 200) return res.status(400).json({ message: 'คำค้นต้องเป็นข้อความไม่เกิน 200 ตัวอักษร' });
+    const pattern = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const publishers = await User.find({ fullName: { $regex: pattern, $options: 'i' } }).select('_id');
     query.$or = [
-      { title: { $regex: search, $options: "i" } },
-      { description: { $regex: search, $options: "i" } },
+      { title: { $regex: pattern, $options: "i" } },
+      { description: { $regex: pattern, $options: "i" } },
+      { hirer: { $in: publishers.map(user => user._id) } },
     ];
   }
 
   const jobs = await Job.find(query)
+    .select(PUBLIC_JOB_FIELDS.join(" "))
     .populate("hirer", "fullName avatarUrl credibilityScore")
     .sort({ createdAt: -1 });
   res.json(jobs);
@@ -279,55 +311,72 @@ const selectWorker = asyncHandler(async (req, res) => {
   const chosen = await JobWaiting.findOne({ job: job._id, worker: workerId, status: "waiting" });
   if (!chosen) return res.status(404).json({ message: "ไม่พบผู้สมัครคนนี้ในคิวของงานนี้" });
 
-  const previousStatus = job.status;
-  // Atomic selection so a cancellation or another selection cannot race with this action.
-  const assignedJob = await Job.findOneAndUpdate(
-    { _id: job._id, hirer: req.user._id, status: "waiting" },
-    { $set: { status: "assigned", selectedWorker: workerId } },
-    { new: true, runValidators: true }
-  );
-  if (!assignedJob) return res.status(409).json({ message: "งานนี้ถูกเลือก Worker หรือยกเลิกไปแล้ว กรุณาโหลดหน้าใหม่" });
-
-  // FR-MATCH-05: ทำเครื่องหมายผู้สมัครรายอื่นทั้งหมดเป็น "ไม่ได้รับเลือก"
-  await JobWaiting.updateMany({ job: job._id, worker: { $ne: workerId } }, { status: "not_selected" });
-  chosen.status = "selected";
-  await chosen.save();
-
-  await logJobStatusChange({
-    jobId: job._id,
-    previousStatus,
-    newStatus: "assigned",
-    changedBy: req.user._id,
-    note: `เลือกผู้รับจ้าง ${workerId}`,
-  });
-
-  // FR-PAY-01/02: เปิด Payment record ให้ตรงเข้าสถานะ "held" ทันที
-  // หมายเหตุ: ระบบยังไม่มี endpoint อัปโหลดสลิปเงินเข้า Escrow แยกต่างหาก (FR-PAY-04 ยังเป็น TODO)
-  // จึงถือว่าเงินเข้า Escrow แล้วทันทีที่เลือกผู้รับจ้าง เพื่อให้ flow ฝั่ง worker ทดสอบได้ครบวงจรก่อน
-  const totalAmount = job.price + (job.deliveryFee || 0);
-  const feePercent = Number(process.env.ESCROW_FEE_PERCENT_MIN) || 5;
-  const feeAmount = Math.round((totalAmount * feePercent) / 100);
-  await Payment.create({
-    job: job._id,
-    hirer: job.hirer,
-    worker: workerId,
-    amount: totalAmount,
-    platformFeePercent: feePercent,
-    platformFeeAmount: feeAmount,
-    netAmountToWorker: totalAmount - feeAmount,
-    status: "held",
-    heldAt: new Date(),
-  });
+  // Keep assignment, waiting-list update, payment creation and audit log together.
+  // Without this transaction an exception after assignment could leave no payment
+  // and the Hirer would be unable to reach the Demo payment step.
+  let assignedJob;
+  try {
+    await withTransaction(async (session) => {
+      assignedJob = await Job.findOneAndUpdate(
+        { _id: job._id, hirer: req.user._id, status: "waiting" },
+        { $set: { status: "assigned", selectedWorker: workerId } },
+        { new: true, runValidators: true, session }
+      );
+      if (!assignedJob) {
+        const conflict = new Error("งานถูกเลือก Worker หรือยกเลิกไปแล้ว");
+        conflict.code = "WORKER_SELECTION_CONFLICT";
+        throw conflict;
+      }
+      const selected = await JobWaiting.updateOne(
+        { job: job._id, worker: workerId, status: "waiting" },
+        { $set: { status: "selected" } }, { session }
+      );
+      if (selected.matchedCount !== 1) {
+        const conflict = new Error("ผู้สมัครไม่อยู่ในคิวงานแล้ว");
+        conflict.code = "WORKER_SELECTION_CONFLICT";
+        throw conflict;
+      }
+      await JobWaiting.updateMany(
+        { job: job._id, worker: { $ne: workerId }, status: "waiting" },
+        { $set: { status: "not_selected" } }, { session }
+      );
+      const amount = Number(job.price) + Number(job.deliveryFee || 0);
+      const paymentTerms = require('../services/paymentTerms.service');
+      const feeBreakdown = paymentTerms.calculateCombinedFees(amount);
+      await Payment.create([{
+        job: job._id, hirer: job.hirer, worker: workerId, amount,
+        platformFeePercent: feeBreakdown.appPercent,
+        platformFeeAmount: feeBreakdown.platformFeeAmount,
+        platformFeeFixedAmount: feeBreakdown.appFixed,
+        netAmountToWorker: amount,
+        status: "pending", paymentMode: "slip_demo",
+        gatewayFeeAmount: feeBreakdown.gatewayFeeAmount,
+        mockGatewayFeeAmount: feeBreakdown.gatewayFeeAmount,
+        mockGatewayFeePercent: feeBreakdown.gatewayPercent,
+        mockGatewayFeeFixedAmount: feeBreakdown.gatewayFixed,
+      }], { session });
+      await logJobStatusChange({
+        jobId: job._id, previousStatus: "waiting", newStatus: "assigned",
+        changedBy: req.user._id, note: `เลือกผู้รับจ้าง ${workerId}`, session,
+      });
+    });
+  } catch (err) {
+    if (err.code === "WORKER_SELECTION_CONFLICT" || err.code === 11000 || err.hasErrorLabel?.("TransientTransactionError")) {
+      return res.status(409).json({ message: "ไม่สามารถเลือก Worker ได้ กรุณาโหลดงานใหม่" });
+    }
+    throw err;
+  }
 
   const io = req.app.get("io");
-  await notifyUser(io, {
-    userId: workerId,
-    type: "application_update",
-    title: "คุณได้รับเลือกให้ทำงานนี้",
-    message: job.title,
-    relatedEntityType: "Job",
-    relatedEntityId: job._id,
-  });
+  try {
+    await notifyUser(io, {
+      userId: workerId,
+      type: "application_update",
+      title: "คุณได้รับเลือกให้ทำงานนี้ (รอชำระ Demo)",
+      message: `งาน \"${job.title}\" รอ Hirer กดยืนยัน Mock Payment ก่อนเริ่มงาน`,
+      relatedEntityType: "Job", relatedEntityId: job._id,
+    });
+  } catch (err) { console.error("Selection notification failed:", err); }
 
   res.json({ message: "เลือกผู้รับจ้างสำเร็จ", job: assignedJob });
 });
@@ -339,61 +388,39 @@ const selectWorker = asyncHandler(async (req, res) => {
 const getMyWorkerJobs = asyncHandler(async (req, res) => {
   const { status = "waiting" } = req.query;
 
-  // Keep the waiting list free of cancelled / closed posts. Cancelled jobs
-  // remain visible in their own tab for Workers who applied before selection.
-  if (status === "waiting" || status === "cancelled") {
-    const applications = await JobWaiting.find({ worker: req.user._id })
-      .populate({ path: "job", populate: { path: "hirer", select: "fullName avatarUrl" } })
-      .sort({ createdAt: -1 });
-
-    if (status === "waiting") {
-      return res.json(applications
-        .filter((a) => a.status === "waiting" && a.job?.status === "waiting")
-        .map((a) => ({
-          id: a.job._id, status: "waiting", backendStatus: "waiting",
-          title: a.job.title, hirerName: a.job.hirer?.fullName || null,
-          price: a.job.price, category: a.job.category, scheduledAt: a.job.scheduledAt,
-        })));
-    }
-
-    // Cancelled after assignment OR after application are both legitimate
-    // cancelled jobs for that Worker. One job appears only once.
-    const cancelledJobs = await Job.find({ selectedWorker: req.user._id, status: "cancelled" })
-      .populate("hirer", "fullName avatarUrl");
-    const byId = new Map();
-    for (const j of cancelledJobs) byId.set(String(j._id), j);
-    for (const a of applications) {
-      if (a.job?.status === "cancelled") byId.set(String(a.job._id), a.job);
-    }
-    return res.json(Array.from(byId.values())
-      .sort((a, b) => new Date(b.cancelledAt || b.updatedAt) - new Date(a.cancelledAt || a.updatedAt))
-      .map((j) => ({
-        id: j._id, status: "cancelled", backendStatus: "cancelled",
-        title: j.title, hirerName: j.hirer?.fullName || null,
-        price: j.price, category: j.category, scheduledAt: j.scheduledAt,
-      })));
-  }
-
   const statusMap = {
-    "in-progress": ["assigned", "in_progress", "awaiting_confirmation"],
-    completed: ["completed"],
+    waiting: ['waiting'], 'in-progress': ['assigned', 'in_progress', 'awaiting_confirmation'],
+    disputed: ['disputed'], completed: ['completed'], cancelled: ['cancelled'],
   };
-  const jobStatuses = statusMap[status];
-  if (!jobStatuses) return res.status(400).json({ message: "status ไม่ถูกต้อง" });
-
-  const jobs = await Job.find({ selectedWorker: req.user._id, status: { $in: jobStatuses } })
-    .populate("hirer", "fullName avatarUrl")
-    .sort({ updatedAt: -1 });
-
-  res.json(jobs.map((j) => ({
-    id: j._id,
-    status,
-    backendStatus: j.status,
-    title: j.title,
-    hirerName: j.hirer?.fullName || null,
-    price: j.price,
-    category: j.category,
-    scheduledAt: j.scheduledAt,
+  if (!statusMap[status]) return res.status(400).json({ message: 'status ไม่ถูกต้อง' });
+  let jobs;
+  if (status === 'waiting') {
+    const applications = await JobWaiting.find({ worker: req.user._id })
+      .populate({ path: 'job', populate: { path: 'hirer', select: 'fullName avatarUrl' } })
+      .sort({ createdAt: -1 });
+    jobs = applications.filter(application => application.status === 'waiting' && application.job?.status === 'waiting')
+      .map(application => application.job);
+  } else {
+    const selected = await Job.find({ selectedWorker: req.user._id }).populate('hirer', 'fullName avatarUrl')
+      .sort({ updatedAt: -1 });
+    jobs = (await withJobPaymentStates(selected)).filter(job => statusMap[status].includes(job.status));
+    if (status === 'cancelled') {
+      const applications = await JobWaiting.find({ worker: req.user._id })
+        .populate({ path: 'job', populate: { path: 'hirer', select: 'fullName avatarUrl' } })
+        .sort({ createdAt: -1 });
+      const byId = new Map(jobs.map(job => [String(job._id), job]));
+      for (const application of applications) {
+        if (application.job?.status === 'cancelled' && !byId.has(String(application.job._id))) {
+          byId.set(String(application.job._id), application.job);
+        }
+      }
+      jobs = [...byId.values()].sort((a, b) => new Date(b.cancelledAt || b.updatedAt || 0) - new Date(a.cancelledAt || a.updatedAt || 0));
+    }
+  }
+  res.json(jobs.map(job => ({
+    id: job._id, status, backendStatus: job.status, paymentStatus: job.paymentStatus || null,
+    title: job.title, hirerName: job.hirer?.fullName || null, hirerAvatarUrl: job.hirer?.avatarUrl || null, price: job.price,
+    category: job.category, scheduledAt: job.scheduledAt,
   })));
 });
 
@@ -401,8 +428,7 @@ const getMyWorkerJobs = asyncHandler(async (req, res) => {
 const PROOF_DIR = path.resolve(process.env.JOB_PROOF_DIR || path.join(__dirname, "..", "..", "uploads", "job-proofs"));
 fs.mkdirSync(PROOF_DIR, { recursive: true });
 
-// Keep an untrusted upload in memory until ownership, state and the image signature
-// have been checked. Nothing is written to disk for invalid / unauthorized requests.
+// Validate before committing image bytes and the job state in the same transaction.
 const proofUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 1 },
@@ -435,12 +461,17 @@ const updateJobStatus = [
     if (allowedTransitions[job.status] !== next) {
       return res.status(409).json({ message: `Cannot change status from ${job.status} to ${next}.` });
     }
+    if (next === "in_progress") {
+      // No Worker can start until the Hirer has explicitly completed mock payment.
+      const paid = await Payment.exists({ job: job._id, worker: req.user._id, status: "held",
+        $or: [{ paymentMode: { $in: ["demo", "stripe_test", "slip_demo"] } }, { paymentMode: { $exists: false } }] });
+      if (!paid) return res.status(409).json({ message: "รอ Hirer กดยืนยันการชำระเงินจำลองก่อนเริ่มงาน" });
+    }
     if (next === "in_progress" && req.file) {
       return res.status(400).json({ message: "Do not attach a photo before starting the job." });
     }
 
     const fields = { status: next };
-    let savedImagePath = null;
     if (next === "awaiting_confirmation") {
       if (!req.file) return res.status(400).json({ message: "Attach a completion photo before submitting the job." });
       const kind = detectProofImage(req.file.buffer);
@@ -448,9 +479,9 @@ const updateJobStatus = [
         return res.status(400).json({ message: "The image content does not match a supported JPG, PNG, or WebP file." });
       }
       const filename = `${job._id}-${randomUUID()}${kind.ext}`;
-      savedImagePath = path.join(PROOF_DIR, filename);
-      await fs.promises.writeFile(savedImagePath, req.file.buffer, { flag: "wx" });
       fields.completionProofUrl = `/uploads/job-proofs/${filename}`;
+      fields.completionProofStorage = "mongodb";
+      fields.completionProofData = req.file.buffer;
       fields.proofSubmittedAt = new Date();
     }
 
@@ -483,7 +514,6 @@ const updateJobStatus = [
         }, session);
       });
     } catch (err) {
-      if (savedImagePath) await fs.promises.unlink(savedImagePath).catch(() => {});
       if (err.code === "JOB_STATUS_CONFLICT") {
         return res.status(409).json({ message: "Job status changed. Refresh and try again." });
       }
@@ -499,6 +529,75 @@ const updateJobStatus = [
   }),
 ];
 
+/** PATCH /api/jobs/:id/completion-proof — Worker can replace evidence until Hirer confirms. */
+const replaceCompletionProof = [
+  uploadProof,
+  asyncHandler(async (req, res) => {
+    const job = await Job.findById(req.params.id);
+    if (!job) return res.status(404).json({ message: "Job not found." });
+    if (String(job.selectedWorker) !== String(req.user._id)) {
+      return res.status(403).json({ message: "Only the selected Worker can replace this proof." });
+    }
+    if (job.status !== "awaiting_confirmation" || job.completionConfirmedAt) {
+      return res.status(409).json({ message: "Proof can only be replaced before Hirer confirms completion." });
+    }
+    if (!req.file) return res.status(400).json({ message: "กรุณาเลือกรูปหลักฐานก่อนยืนยัน" });
+    const kind = detectProofImage(req.file.buffer);
+    if (!kind || kind.mime !== req.file.mimetype) {
+      return res.status(400).json({ message: "ไฟล์ต้องเป็นรูป JPG, PNG หรือ WebP ที่ถูกต้อง" });
+    }
+    // Image bytes and their new version commit together in the existing database.
+    // The CAS also races safely with Hirer confirmation.
+    const newFilename = `${job._id}-${randomUUID()}${kind.ext}`;
+    const newProofUrl = `/uploads/job-proofs/${newFilename}`;
+    let updated;
+    let notification;
+    try {
+      await withTransaction(async (session) => {
+        updated = await Job.findOneAndUpdate(
+          {
+            _id: job._id, selectedWorker: req.user._id,
+            status: "awaiting_confirmation", completionConfirmedAt: null,
+            completionProofUrl: job.completionProofUrl,
+          },
+          { $set: { completionProofUrl: newProofUrl, completionProofStorage: "mongodb", completionProofData: req.file.buffer, proofSubmittedAt: new Date() } },
+          { new: true, runValidators: true, session }
+        );
+        if (!updated) {
+          const conflict = new Error("Proof update conflicts with job confirmation");
+          conflict.code = "JOB_PROOF_CONFLICT";
+          throw conflict;
+        }
+        await logJobStatusChange({
+          jobId: updated._id, previousStatus: "awaiting_confirmation",
+          newStatus: "awaiting_confirmation", changedBy: req.user._id,
+          note: "Worker replaced completion proof", session,
+        });
+        notification = await createNotification({
+          userId: updated.hirer,
+          type: "job_status_change",
+          title: "Completion proof updated",
+          message: `Worker updated the photo for "${updated.title}". Please review the latest proof.`,
+          relatedEntityType: "Job", relatedEntityId: updated._id,
+        }, session);
+      });
+    } catch (err) {
+      if (err.code === "JOB_PROOF_CONFLICT") {
+        return res.status(409).json({ message: "Job has changed or Hirer confirmed it. Refresh and try again." });
+      }
+      throw err;
+    }
+    // Delete the replaced local file ONLY after the database commit. Preserve
+    // older/non-local proof paths rather than following arbitrary file URLs.
+    const matchOld = /^\/uploads\/job-proofs\/([a-zA-Z0-9_.-]+)$/.exec(job.completionProofUrl || "");
+    if (matchOld && matchOld[1] !== "." && matchOld[1] !== ".." && matchOld[1] !== newFilename) {
+      await fs.promises.unlink(path.join(PROOF_DIR, matchOld[1])).catch(() => {});
+    }
+    await deliverNotification(req.app.get("io"), notification);
+    res.json({ message: "เปลี่ยนรูปหลักฐานเรียบร้อยแล้ว กำลังรอ Hirer ยืนยัน", job: updated });
+  }),
+];
+
 /** GET /api/jobs/:id/completion-proof — only the Hirer, selected Worker or Admin. */
 const getCompletionProof = asyncHandler(async (req, res) => {
   const job = await Job.findById(req.params.id);
@@ -508,17 +607,11 @@ const getCompletionProof = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: "ไม่มีสิทธิ์ดูหลักฐานของงานนี้" });
   }
 
-  // Resolve only stored paths belonging to our private proof directory. Never accept
-  // filename/path input from the request (prevents path traversal).
-  const match = /^\/uploads\/job-proofs\/([a-zA-Z0-9_.-]+)$/.exec(job.completionProofUrl || "");
-  if (!match || match[1] === "." || match[1] === "..") {
-    return res.status(404).json({ message: "ยังไม่มีหลักฐานของงานนี้" });
-  }
   let content;
   try {
-    content = await fs.promises.readFile(path.join(PROOF_DIR, match[1]));
+    content = await readCompletionProof(job);
   } catch (err) {
-    if (err.code === "ENOENT") return res.status(404).json({ message: "ไม่พบไฟล์หลักฐาน" });
+    if (err.statusCode) return res.status(err.statusCode).json({ message: err.message });
     throw err;
   }
   const image = detectProofImage(content);
@@ -544,16 +637,12 @@ const confirmCompletion = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: "No completion photo is attached to this job." });
   }
 
-  const proofMatch = /^\/uploads\/job-proofs\/([a-zA-Z0-9_.-]+)$/.exec(job.completionProofUrl);
-  if (!proofMatch || proofMatch[1] === "." || proofMatch[1] === "..") {
-    return res.status(400).json({ message: "Completion proof path is invalid. Ask the Worker to submit the photo again." });
-  }
   let proofBytes;
   try {
-    proofBytes = await fs.promises.readFile(path.join(PROOF_DIR, proofMatch[1]));
+    proofBytes = await readCompletionProof(job);
   } catch (err) {
-    if (err.code === "ENOENT") {
-      return res.status(409).json({ message: "Completion photo is missing from storage. Ask the Worker to submit the photo again." });
+    if (err.statusCode) {
+      return res.status(409).json({ message: err.message });
     }
     throw err;
   }
@@ -587,13 +676,29 @@ const confirmCompletion = asyncHandler(async (req, res) => {
 
       payment = await Payment.findOneAndUpdate(
         { job: updated._id, hirer: updated.hirer, worker: updated.selectedWorker, status: "held" },
-        { $set: { status: "released", releasedAt: confirmedAt } },
+        { $set: { status: "payout_pending", jobCompletedAt: confirmedAt, releasedAt: null, paidAt: null } },
         { new: true, runValidators: true, session }
       );
       if (!payment) {
         const missingPayment = new Error("The demo payment is not in held state.");
         missingPayment.code = "PAYMENT_NOT_HELD";
         throw missingPayment;
+      }
+
+      // Service Post quotas are concurrent, not lifetime totals. When a service-origin
+      // job completes, release its slot; only reopen auto-capacity closures (never manual ones).
+      if (updated.originServiceRequest) {
+        const origin = await ServiceRequest.findById(updated.originServiceRequest).session(session);
+        if (origin?.servicePost) {
+          const servicePost = await ServicePost.findById(origin.servicePost).session(session);
+          if (servicePost && servicePost.currentOrderCount > 0) {
+            const reopen = servicePost.status === "closed" && servicePost.closeReason === "capacity" &&
+              servicePost.availabilityEnd > new Date();
+            const change = { $inc: { currentOrderCount: -1 } };
+            if (reopen) change.$set = { status: "active", closeReason: null };
+            await ServicePost.updateOne({ _id: servicePost._id, currentOrderCount: { $gt: 0 } }, change, { session });
+          }
+        }
       }
 
       await logJobStatusChange({
@@ -609,10 +714,10 @@ const confirmCompletion = asyncHandler(async (req, res) => {
       notifications.push(await createNotification({
         userId: updated.selectedWorker,
         type: "payment_update",
-        title: "Demo payment recorded",
-        message: `The demo payment for "${updated.title}" is recorded as released. No real transfer occurred.`,
-        relatedEntityType: "Payment",
-        relatedEntityId: payment._id,
+        title: "งานผ่านการตรวจรับแล้ว รอผู้ดูแลจ่ายค่าจ้าง",
+        message: `งาน "${updated.title}" เสร็จแล้ว ค่าจ้างอยู่ระหว่างรอผู้ดูแลบันทึกจ่ายพร้อมสลิป (โหมดทดสอบ ไม่มีการโอนเงินจริง)`,
+        relatedEntityType: "Job",
+        relatedEntityId: updated._id,
       }, session));
       notifications.push(await createNotification({
         userId: updated.selectedWorker,
@@ -637,7 +742,7 @@ const confirmCompletion = asyncHandler(async (req, res) => {
   await Promise.all(notifications.map((notification) => deliverNotification(io, notification)));
 
   res.json({
-    message: "Job confirmed. The payment record is in DEMO mode; no real transfer occurred.",
+    message: "ตรวจรับงานแล้ว รอ admin บันทึกจ่ายค่าจ้างพร้อมสลิป (โหมดทดสอบ ไม่มีการโอนเงินจริง)",
     job: updated,
     payment,
   });
@@ -645,5 +750,5 @@ const confirmCompletion = asyncHandler(async (req, res) => {
 
 module.exports = {
   createJob, getMyJobs, getJobById, getJobTimeline, cancelJob,
-  getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion, getCompletionProof,
+  getFeed, applyToJob, getApplicants, selectWorker, getMyWorkerJobs, updateJobStatus, confirmCompletion, getCompletionProof, replaceCompletionProof,
 };
