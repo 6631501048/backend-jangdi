@@ -6,8 +6,8 @@ const { notifyUser } = require("../services/notification.service");
 const { notifyNearbyWorkers } = require("../services/matching.service");
 
 // Never expose password hashes, verification secrets, banking details or precise location in Admin user lists.
-const ADMIN_USER_FIELDS = "studentId email fullName currentRole accountStatus isEmailVerified isProfileComplete createdAt updatedAt +moderationHistory";
-const ADMIN_USER_RESULT_FIELDS = "studentId email fullName currentRole accountStatus isEmailVerified isProfileComplete createdAt updatedAt";
+const ADMIN_USER_FIELDS = "studentId email fullName avatarUrl currentRole accountStatus isEmailVerified isProfileComplete createdAt updatedAt +moderationHistory";
+const ADMIN_USER_RESULT_FIELDS = "studentId email fullName avatarUrl currentRole accountStatus isEmailVerified isProfileComplete createdAt updatedAt";
 const moderationActions = Object.freeze({ warn: "warned", suspend: "suspended", clear: "active" });
 const validId = (id) => mongoose.isValidObjectId(id);
 
@@ -49,8 +49,8 @@ const getAllJobs = asyncHandler(async (req, res) => {
   const [jobs, total, counts] = await Promise.all([
     Job.find(filter)
       .select("title description category status hirer selectedWorker price deliveryFee scheduledAt createdAt updatedAt approvedAt approvedBy rejectionReason cancelReason cancelledAt proofSubmittedAt completionConfirmedAt")
-      .populate("hirer", "fullName email")
-      .populate("selectedWorker", "fullName")
+      .populate("hirer", "fullName email avatarUrl")
+      .populate("selectedWorker", "fullName avatarUrl")
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit),
@@ -79,7 +79,7 @@ const getAllServicePosts = asyncHandler(async (req, res) => {
   }
   const [posts, total] = await Promise.all([
     ServicePost.find(filter).select("worker title description category fee status rejectionReason availabilityEnd createdAt currentOrderCount maxSimultaneousOrders")
-      .populate("worker", "fullName email").sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit),
+      .populate("worker", "fullName email avatarUrl").sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit),
     ServicePost.countDocuments(filter),
   ]);
   res.json({ posts, total, page, limit, totalPages: Math.ceil(total / limit) });

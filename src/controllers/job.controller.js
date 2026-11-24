@@ -419,7 +419,7 @@ const getMyWorkerJobs = asyncHandler(async (req, res) => {
   }
   res.json(jobs.map(job => ({
     id: job._id, status, backendStatus: job.status, paymentStatus: job.paymentStatus || null,
-    title: job.title, hirerName: job.hirer?.fullName || null, price: job.price,
+    title: job.title, hirerName: job.hirer?.fullName || null, hirerAvatarUrl: job.hirer?.avatarUrl || null, price: job.price,
     category: job.category, scheduledAt: job.scheduledAt,
   })));
 });
