@@ -6,6 +6,8 @@ router.use("/jobs", require("./job.routes"));
 router.use("/service-posts", require("./servicePost.routes"));
 router.use("/payments", require("./payment.routes"));
 router.use("/sos", require("./sos.routes"));
+router.use("/tester-feedback", require("./testerFeedback.routes"));
+router.use("/admin/tester-feedback", require("./adminTesterFeedback.routes"));
 router.use("/admin", require("./admin.routes"));
 router.use("/notifications", require("./notification.routes"));
 router.use("/reports", require("./report.routes"));

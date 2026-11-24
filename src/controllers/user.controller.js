@@ -27,7 +27,8 @@ async function isActiveCounterpart(viewerId, targetId) {
  *  - เจ้าของบัญชี / Admin  : ครบทุก field (ยกเว้น password และ token ที่ select:false อยู่แล้ว)
  *  - คู่งานที่กำลังทำงานร่วมกัน : ข้อมูลสาธารณะ + เบอร์โทร + LINE
  *  - ผู้ใช้อื่นทั่วไป         : ข้อมูลสาธารณะเท่านั้น (ชื่อ รูป คำอธิบาย คะแนน)
- *  ไม่มีใครนอกจากเจ้าของ/Admin ที่เห็น บัญชีธนาคาร ที่อยู่ อีเมล รหัสนักศึกษา พิกัด
+ *  อีเมลเปิดเฉพาะคู่จ้างงานหลังยืนยันจ้าง รวมงานที่จบหรือยกเลิกหลังเลือกผู้รับจ้าง
+ *  บัญชีธนาคาร ที่อยู่ รหัสนักศึกษา และพิกัดยังเป็นข้อมูลส่วนตัว
  */
 const getProfile = asyncHandler(async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.id)) {
@@ -49,7 +50,17 @@ const getProfile = asyncHandler(async (req, res) => {
     createdAt: user.createdAt,
   };
 
-  if (await isActiveCounterpart(req.user._id, user._id)) {
+  const activeCounterpart = await isActiveCounterpart(req.user._id, user._id);
+  const previousCounterpart = !activeCounterpart && await Job.exists({
+    status: { $in: ["completed", "cancelled"] },
+    $or: [
+      { hirer: req.user._id, selectedWorker: user._id },
+      { hirer: user._id, selectedWorker: req.user._id },
+    ],
+  });
+  publicProfile.canViewEmail = !!(activeCounterpart || previousCounterpart);
+  if (publicProfile.canViewEmail) publicProfile.email = user.email;
+  if (activeCounterpart) {
     publicProfile.phone = user.phone;
     publicProfile.lineId = user.lineId;
   }
@@ -115,6 +126,16 @@ const updateProfile = asyncHandler(async (req, res) => {
 
   const { fullName, shortDescription, phone, lineId, facebook, instagram, avatarUrl, bankAccount, contactAddress, lat, lng } = req.body;
 
+  const bankComplete = (bank) => bank && ["bankName", "accountNumber", "accountHolderName"].every(key => typeof bank[key] === "string" && bank[key].trim());
+  if (!user.isAdmin && !user.isProfileComplete) {
+    const name = fullName === undefined ? user.fullName : fullName;
+    const contactPhone = phone === undefined ? user.phone : phone;
+    const bank = bankAccount === undefined ? user.bankAccount : bankAccount;
+    if (typeof name !== "string" || !name.trim() || typeof contactPhone !== "string" || !contactPhone.trim() || !bankComplete(bank)) {
+      return res.status(400).json({ message: "กรุณากรอกชื่อ เบอร์โทร และบัญชีธนาคารให้ครบก่อนเริ่มใช้งาน (ใช้ข้อมูลบัญชีสมมติสำหรับการทดสอบได้)" });
+    }
+  }
+
   if (fullName !== undefined) user.fullName = fullName;
   if (shortDescription !== undefined) user.shortDescription = shortDescription;
   if (phone !== undefined) user.phone = phone;
@@ -130,8 +151,8 @@ const updateProfile = asyncHandler(async (req, res) => {
     user.lastKnownLocation = { type: "Point", coordinates: [Number(lng), Number(lat)] };
   }
 
-  // FR-AUTH-05: กรอกข้อมูลจำเป็น (ชื่อ + เบอร์โทร) ครบแล้วถือว่าโปรไฟล์สมบูรณ์
-  if (user.fullName && user.phone) {
+  // First-time members complete onboarding with contact and bank details; existing accounts remain usable.
+  if (user.fullName && user.phone && (user.isAdmin || user.isProfileComplete || bankComplete(user.bankAccount))) {
     user.isProfileComplete = true;
   }
 
