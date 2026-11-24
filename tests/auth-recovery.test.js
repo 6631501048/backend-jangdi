@@ -118,6 +118,9 @@ test('Google-only account gains a password through email recovery without a dupl
   assert.equal(result.status, 200);
   const token = emailedToken();
   assert.equal(users.get(id).passwordResetToken, hashResetToken(token));
+  const issued = users.get(id).passwordResetRequestedAt.getTime();
+  assert.equal(users.get(id).passwordResetExpires.getTime() - issued, 15 * 60_000);
+  assert(mails.at(-1).html.includes('15 นาที'));
   assert(!JSON.stringify(result.body).includes(token));
   const reset = await request('reset-password', { token, password: 'new-account-password' });
   assert.equal(reset.status, 200); assert.equal(users.size, 1);

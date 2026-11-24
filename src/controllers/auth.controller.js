@@ -294,12 +294,12 @@ const forgotPassword = asyncHandler(async (req, res) => {
   const user = await User.findOneAndUpdate({
     email, accountStatus: { $ne: 'suspended' },
     $or: [{ passwordResetRequestedAt: null }, { passwordResetRequestedAt: { $lte: new Date(now.getTime() - 60_000) } }],
-  }, { $set: { passwordResetToken: tokenHash, passwordResetExpires: new Date(now.getTime() + 30 * 60_000), passwordResetRequestedAt: now } }, { new: true });
+  }, { $set: { passwordResetToken: tokenHash, passwordResetExpires: new Date(now.getTime() + 15 * 60_000), passwordResetRequestedAt: now } }, { new: true });
   if (user) {
     // The fragment keeps the secret out of HTTP request URLs and referrer headers.
     resetUrl.hash = `token=${token}`;
     const result = await sendEmail({ to: user.email, subject: 'ตั้งรหัสผ่านบัญชี JangDi',
-      html: `<p>คุณขอตั้งรหัสผ่านสำหรับบัญชี JangDi</p><p><a href="${resetUrl.href}">ตั้งรหัสผ่านใหม่</a></p><p>ลิงก์ใช้ได้ครั้งเดียวและหมดอายุใน 30 นาที ใช้ได้ทั้งการตั้งรหัสผ่านครั้งแรกและการลืมรหัสผ่าน</p><p>หากไม่ได้เป็นผู้ขอ สามารถข้ามอีเมลนี้ได้ รหัสผ่านเดิมยังใช้งานได้</p>` });
+      html: `<p>คุณขอตั้งรหัสผ่านสำหรับบัญชี JangDi</p><p><a href="${resetUrl.href}">ตั้งรหัสผ่านใหม่</a></p><p>ลิงก์ใช้ได้ครั้งเดียวและหมดอายุใน 15 นาที ใช้ได้ทั้งการตั้งรหัสผ่านครั้งแรกและการลืมรหัสผ่าน</p><p>หากไม่ได้เป็นผู้ขอ สามารถข้ามอีเมลนี้ได้ รหัสผ่านเดิมยังใช้งานได้</p>` });
     if (!result.sent) {
       // Don't invalidate a newer request if sending this older email failed.
       await User.updateOne({ _id: user._id, passwordResetToken: tokenHash }, { $set: { passwordResetToken: null, passwordResetExpires: null, passwordResetRequestedAt: null } });

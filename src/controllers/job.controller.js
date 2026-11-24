@@ -7,7 +7,7 @@ const fs = require("fs");
 const { randomUUID } = require("crypto");
 const { detectProofImage } = require("../utils/proofImage");
 const { readCompletionProof } = require("../services/jobProof.service");
-const { Job, JobWaiting, Payment, JobLog, ServiceRequest, ServicePost } = require("../models");
+const { Job, JobWaiting, Payment, JobLog, ServiceRequest, ServicePost, User } = require("../models");
 const { checkContent } = require("../utils/contentFilter");
 const { logJobStatusChange } = require("../services/jobLog.service");
 const { createNotification, deliverNotification, notifyUser } = require("../services/notification.service");
@@ -211,9 +211,13 @@ const getFeed = asyncHandler(async (req, res) => {
   const query = { status: "waiting", completionConfirmedAt: null };
   if (category && category !== "all") query.category = category;
   if (search) {
+    if (typeof search !== 'string' || search.length > 200) return res.status(400).json({ message: 'คำค้นต้องเป็นข้อความไม่เกิน 200 ตัวอักษร' });
+    const pattern = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const publishers = await User.find({ fullName: { $regex: pattern, $options: 'i' } }).select('_id');
     query.$or = [
-      { title: { $regex: search, $options: "i" } },
-      { description: { $regex: search, $options: "i" } },
+      { title: { $regex: pattern, $options: "i" } },
+      { description: { $regex: pattern, $options: "i" } },
+      { hirer: { $in: publishers.map(user => user._id) } },
     ];
   }
 
